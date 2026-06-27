@@ -696,6 +696,8 @@ def main() -> None:
         )
 
     async def post_init(application):
+        # Сбрасываем старые polling-сессии при старте
+        await application.bot.delete_webhook(drop_pending_updates=True)
         await application.bot.set_my_commands([
             BotCommand("track",  "Отслеживать маршрут — /track 212"),
             BotCommand("where",  "Где сейчас ТС маршрута — /where 212"),
@@ -720,7 +722,7 @@ def main() -> None:
     app.job_queue.run_repeating(poll_job, interval=POLL_INTERVAL, first=15)
 
     log.info("Бот запущен. Интервал опроса: %d сек.", POLL_INTERVAL)
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
