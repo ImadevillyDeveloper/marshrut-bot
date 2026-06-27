@@ -1,0 +1,727 @@
+#!/usr/bin/env python3
+"""
+Telegram bot: мониторинг появления ТС на маршрутах (bus-55.ru / Navitrans / ГЛОНАСС).
+
+Запуск:
+    set TELEGRAM_BOT_TOKEN=<токен>
+    python bot.py
+"""
+
+import os
+import sqlite3
+import hashlib
+import time
+import math
+import logging
+import asyncio
+import threading
+from datetime import datetime
+from collections import defaultdict
+from typing import Optional
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+DB_PATH = os.path.join(os.path.dirname(__file__), "marshrut.db")
+
+import requests as http
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger(__name__)
+
+# ── Navitrans / bus-55.ru API ──────────────────────────────────────
+
+BUS55_BASE    = "https://bus-55.ru/api/rpc.php"
+BUS55_RPC     = "2․2"          # специальная точка (U+2024) — как в оригинале
+BUS55_SYS_ID  = "omsk"
+BUS55_HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Origin":       "https://bus-55.ru",
+    "Referer":      "https://bus-55.ru/",
+}
+
+_session: dict = {"sid": None, "exp": 0.0}
+_req_id: list  = [0]
+
+
+def _ts() -> int:
+    t = int(time.time())
+    while t % 10 in (0, 3, 7):
+        t += 1
+    return t
+
+
+def _next_id() -> int:
+    while True:
+        _req_id[0] += 1
+        if _req_id[0] % 7 != 0:
+            return _req_id[0]
+
+
+def _sign(method: str, req_id: int, sid: str) -> tuple[str, str]:
+    raw  = hashlib.sha1(f"{method}~{BUS55_SYS_ID}~{req_id}~{sid}".encode()).hexdigest()
+    guid = f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[24:28]}-{raw[28:40]}"
+    return f"{BUS55_BASE}?m={guid}", raw[16:24]
+
+
+def _start_session() -> Optional[str]:
+    try:
+        r = http.post(BUS55_BASE, headers=BUS55_HEADERS, json={
+            "jsonrpc": BUS55_RPC, "method": "startSession",
+            "ts": _ts(), "params": {}, "id": 1,
+        }, timeout=6)
+        sid = r.json()["result"]["sid"]
+        _session["sid"] = sid
+        _session["exp"] = time.time() + 3500
+        return sid
+    except Exception as e:
+        log.warning("Сессия Navitrans не открылась: %s", e)
+        return None
+
+
+def _get_sid() -> Optional[str]:
+    if not _session["sid"] or time.time() > _session["exp"]:
+        return _start_session()
+    return _session["sid"]
+
+
+def _rpc(method: str, params: dict) -> dict:
+    sid = _get_sid()
+    if not sid:
+        return {}
+    rid = _next_id()
+    url, magic = _sign(method, rid, sid)
+    r = http.post(url, headers=BUS55_HEADERS, json={
+        "jsonrpc": BUS55_RPC, "method": method,
+        "ts": _ts(), "id": rid,
+        "params": {"sid": sid, "magic": magic, **params},
+    }, timeout=8)
+    return r.json()
+
+
+def fetch_vehicles() -> list[dict]:
+    """Все активные ТС в границах Омска."""
+    for attempt in range(2):
+        try:
+            sid = _get_sid()
+            if not sid:
+                return []
+            rid = _next_id()
+            url, magic = _sign("getUnitsInRect", rid, sid)
+            r = http.post(url, headers=BUS55_HEADERS, json={
+                "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
+                "ts": _ts(), "id": rid,
+                "params": {
+                    "sid": sid, "magic": magic,
+                    "minlat": 54.80, "maxlat": 55.15,
+                    "minlong": 73.10, "maxlong": 73.70,
+                },
+            }, timeout=8)
+            data = r.json()
+            if "error" in data:
+                code = data["error"].get("code", 0)
+                if code == -33100 and attempt == 0:
+                    _session["sid"] = None
+                    continue
+                return []
+            result = data.get("result", [])
+            return result if isinstance(result, list) else []
+        except Exception as e:
+            if attempt == 0:
+                _session["sid"] = None
+            else:
+                log.warning("fetch_vehicles: %s", e)
+    return []
+
+
+def fetch_route_stops(mr_id: str) -> list[dict]:
+    """Список остановок маршрута с именами: [{name, lat, lng}, ...]."""
+    try:
+        data = _rpc("getRoute", {"mr_id": mr_id})
+        races = data.get("result", {}).get("races", [])
+        stops: list[dict] = []
+        seen: set[str] = set()
+        for race in races:
+            for s in race.get("stopList", []):
+                lat  = s.get("st_lat")
+                lng  = s.get("st_long")
+                name = (s.get("st_title") or s.get("st_name") or "").strip()
+                if lat and lng and name and name not in seen:
+                    stops.append({"name": name, "lat": float(lat), "lng": float(lng)})
+                    seen.add(name)
+        return stops
+    except Exception as e:
+        log.warning("fetch_route_stops mr_id=%s: %s", mr_id, e)
+        return []
+
+
+# Полный справочник маршрутов Омска: номер -> описание
+OMSK_ROUTES: dict[str, str] = {
+    "1": "ул. Бархатовой — Омский нефтеперерабатывающий завод",
+    "3": "ул. Бархатовой — микрорайон «Входной»",
+    "6Н": "ул. 3-я Железнодорожная — завод им. Попова",
+    "8Н": "ЗАО МПК Компур (СНТ Медик) — МСЧ-9",
+    "12": "пос. Ермак — пос. Большие Поля",
+    "13": "пос. Чкаловский — микрорайон «Осташково»",
+    "14": "пос. Мелиораторов — пос. Николаевка (пос. Юбилейный)",
+    "16": "Трикотажная фабрика — пос. Рыбачий",
+    "17": "Железнодорожный вокзал — Ново-Кировское кладбище (пос. Новостройка)",
+    "20": "Омский нефтеперерабатывающий завод (пос. Ермак) — ул. Гашека",
+    "21": "ДСК-2 — Кожевенный Завод",
+    "22": "ул. Бархатовой — МСЧ-9 (ул. Индустриальная)",
+    "23": "пос. Чкаловский — 12-й микрорайон ул. Ватутина",
+    "24": "Железнодорожный вокзал — пос. Солнечный",
+    "25": "Дом Туриста — микрорайон «Новоалександровский»",
+    "26": "Микрорайон «Булатово» — пос. Чкаловский",
+    "28": "Площадь Победы — Поворотная",
+    "29": "Микрорайон «Первокирпичный» (ул. 21-я Амурская) — Омский НПЗ (пос. Ермак)",
+    "30": "ул. Лобкова — пос. Армейский",
+    "31Н": "пос. Светлый — ТК Лента",
+    "32": "ул. Бархатовой — Железнодорожный вокзал",
+    "33": "ул. 3-я Железнодорожная — ул. Бархатовой",
+    "34": "Площадь Победы — пос. Большие Поля Северо-Восточное кладбище",
+    "37": "пос. Солнечный — микрорайон «Входной»",
+    "39": "пос. Чкаловский — пос. Степной (СНТ «Ивушка»)",
+    "41": "пос. Светлый — ул. Л. Чайкиной",
+    "42": "ПО Иртыш — ул. Бархатовой",
+    "45": "Ясная Поляна — пос. Амурский-2",
+    "46": "СНТ Заря-2 — ул. Облепиховая",
+    "47Н": "ул. Гашека — Онкологический диспансер",
+    "49": "ул. 21-я Амурская — ПО «Иртыш»",
+    "51": "Речной порт — СНТ Березка",
+    "54": "Микрорайон «Рябиновка» — пос. Юбилейный",
+    "55": "ул. Лобкова — микрорайон «Булатово»",
+    "58": "пос. Чкаловский — ПО «Иртыш»",
+    "59": "Биофабрика — Омский нефтеперерабатывающий завод (пос. Ермак)",
+    "61": "пос. Солнечный — ул. Гашека",
+    "62": "пос. Большая Островка — ул. Партизанская — пос. Большая Островка",
+    "63": "МСЧ-9 — гараж ЦС",
+    "64": "мкр. Зеленая река — пос. Дальний",
+    "66": "ул. 1-я Учхозная — Омский нефтеперерабатывающий завод",
+    "67": "пос. Солнечный — Омский нефтеперерабатывающий завод пос. Ермак",
+    "68": "МСЧ-9 — СНТ «Заря-2»",
+    "69": "ул. Стрельникова — ПО Иртыш",
+    "71": "ул. Лобкова — СНТ «Тепличный-3»",
+    "72": "пос. Чкаловский — пос. Большие поля",
+    "73": "пос. Чкаловский — ул. Стрельникова",
+    "77": "пос. Солнечный — пл. Победы",
+    "78": "пос. Солнечный — пос. Биофабрика",
+    "79": "ул. Бархатовой — ул. Володарского",
+    "83": "ул. Стрельникова — Кирпичный завод",
+    "83Н": "ул. Стрельникова — Кирпичный завод",
+    "87": "РЭБ — завод СК",
+    "88": "пос. Рыбачий — пос. Чукреевка",
+    "89": "ул. Лобкова — пос. Дальний",
+    "90": "ул. Бархатовой — пос. Солнечный (СНТ «Медик»)",
+    "94": "ул. Крупской — микрорайон «Первокирпичный» (микрорайон Загородный)",
+    "95": "Строительный рынок «Южный» — 12-й микрорайон (СТЦ «МЕГА»)",
+    "96": "ООО «Лента» — ул. Крупской",
+    "97": "Микрорайон «Амурский-2» — МСЧ-9",
+    "98": "ул. Нефтезаводская — ул. Попова — ул. Студенческая",
+    "103": "пос. Солнечный — Онкодиспансер",
+    "109": "пос. Солнечный — Речной порт",
+    "110": "ул. Бархатовой — Железнодорожный вокзал",
+    "112": "ул. Гашека — СНТ «Осташково»",
+    "117Н": "ул. Лобкова — пос. Новая Станица",
+    "119": "пос. Чкаловский — микрорайон «Осташково» СНТ «Осташково»",
+    "122": "ул. Лобкова — СНТ 33 км Русско-Полянского тракта",
+    "125": "Железнодорожный вокзал — микрорайон «Входной» (пос. Северный)",
+    "126": "Омск — п. Ростовка (с. Новомосковка)",
+    "131": "ул. 25-я Линия — СНТ «Золотое Руно»",
+    "138": "ул. Партизанская — пос. Ростовка (с. Новомосковка)",
+    "139": "пос. Ермак — микрорайон «Входной»",
+    "141": "пос. Чкаловский — СНТ «Золотое Руно»",
+    "144П": "пос. Солнечный — СНТ Автомобилист-2 (Переезд)",
+    "145П": "ул. Нефтезаводская — СНТ Росинка",
+    "156П": "ПО «Иртыш» — СНТ «Кварц»",
+    "171": "пос. Чкаловский — СНТ «Осташково»",
+    "173П": "ул. Ватутина — СНТ «Заозерный»",
+    "174П": "ул. Дружбы — СНТ «Кедр»",
+    "178": "ПО «Иртыш» — СНТ «Осташково»",
+    "190П": "пос. Солнечный — СНТ «Авиатор»",
+    "200": "ул. Бархатовой — ЗАО «ТЦ «Континент»",
+    "203": "ул. Бархатовой — пос. Юбилейный",
+    "212": "СТЦ «МЕГА» — Бауцентр",
+    "222": "МСЧ-9 — Онкодиспансер",
+    "272": "СТЦ «МЕГА» — ул. Малиновского",
+    "303": "ул. Лобкова — ПО Иртыш",
+    "305": "ул. Стрельникова — Аэропорт",
+    "323": "ул. 3-я Железнодорожная — ул. Бархатовой",
+    "331": "ПО «Иртыш» — СТЦ «МЕГА»",
+    "335": "проспект Губкина — ул. 1 Мая",
+    "343Н": "ДСК-2 — Микрорайон «Амурский-2»",
+    "344": "ООО «Лента» — пос. Новостройка",
+    "346": "ул. 1-я Красной Звезды — ул. 50 лет Октября",
+    "350": "пос. Степной СНТ «Ивушка» — пос. Карьер «СНТ «Маяк-2»",
+    "353": "пос. Дальний — Гараж ЦС",
+    "359": "Кирпичный завод — пос. Чкаловский",
+    "385": "ул. Стрельникова — ПО «Иртыш»",
+    "386": "Микрорайон «Амурский-2» — ул. 1-я Учхозная",
+    "392": "ПО «Иртыш» — Гараж ЦС",
+    "394": "пос. Мелиораторов — Красноярский тракт",
+    "399": "СНТ «Молния-5» — Оптовый рынок Черлакский тракт",
+    "409": "Микрорайон «Рябиновка» — ул. Труда",
+    "410": "МСЧ-9 — ООО «ОБИ»",
+    "414": "Микрорайон «Ясная Поляна» — Онкодиспансер Микрорайон «Первокирпичный»",
+    "415": "ЗАО ТЦ «Континент» — Омский нефтеперерабатывающий завод пос. Ермак",
+    "418": "ул. Крымская — ул. Дергачева",
+    "421": "пос. Юбилейный — завод СК",
+    "424": "СНТ «Заря-2» — пос. Юбилейный",
+    "425": "Красноярский тракт — Омский нефтеперерабатывающий завод пос. Ермак",
+    "470Н": "пос. Чкаловский — ДСК-2",
+    "500": "ООО «Лента» — ДСК-2",
+    "501А": "ул. Бархатовой — Арена-Омск",
+    "502А": "ул. Бархатовой — Арена-Омск",
+    "503": "СТЦ «МЕГА» — микрорайон «Загородный»",
+    "503А": "пос. Ермак — Арена-Омск",
+    "504А": "ул. Стрельникова — Арена-Омск",
+    "505А": "пос. Ермак — Арена-Омск",
+    "506А": "пос. Николаевка — Арена-Омск",
+    "507А": "Первокирпичный — Арена-Омск",
+    "508А": "микр. Амурский-2 — Арена-Омск",
+    "509А": "ул. 21-я Амурская — Арена-Омск",
+    "510А": "пос. Чкаловский — Арена-Омск",
+    "511А": "пос. Биофабрика — Арена-Омск",
+    "512А": "пос. Чкаловский — Арена-Омск",
+    "513А": "ул. Гашека — Арена-Омск",
+    "514": "ул. Бархатовой — ул. 3-й Разъезд",
+    "514А": "пос. Булатова — Арена-Омск",
+    "515А": "ПО Иртыш — Арена-Омск",
+    "516А": "ПО Иртыш — Арена-Омск",
+    "517А": "МСЧ №9 — Арена-Омск",
+    "518А": "пос. Солнечный — Арена-Омск",
+    "519А": "микр. Ясная поляна — Арена-Омск",
+    "520А": "Микрорайон Входной — Арена-Омск",
+    "550": "ПО «Иртыш» — микрорайон «Амурский-2»",
+    "568": "ООО «Лента» СНТ «Золотое Руно» — СНТ «Заря-2»",
+    "910": "пл. Победы — Ростовка — Новомосковка",
+}
+
+
+async def subscribe(update: Update, route: str) -> None:
+    """Общая логика подписки на маршрут."""
+    uid = update.effective_user.id
+    route = route.strip().upper()
+
+    vehicles = fetch_vehicles()
+
+    for v in vehicles:
+        if str(v.get("mr_num", "")).upper() == route:
+            mid = str(v.get("mr_id", ""))
+            if mid:
+                mr_id_cache[route] = mid
+                break
+
+    if route not in mr_id_cache:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT mr_id FROM route_navitrans_ids WHERE route_number = ?", (route,))
+            row = c.fetchone()
+            conn.close()
+            if row:
+                mr_id_cache[route] = str(row[0])
+        except Exception:
+            pass
+
+    if route in mr_id_cache:
+        mid = mr_id_cache[route]
+        if mid not in stops_cache:
+            stops_cache[mid] = fetch_route_stops(mid)
+
+    current_ids = {
+        str(v.get("u_id", ""))
+        for v in vehicles
+        if str(v.get("mr_num", "")).upper() == route and v.get("u_id")
+    }
+    known_vehicles[route] = current_ids
+    subscriptions[uid].add(route)
+
+    count = len(current_ids)
+    total = len(subscriptions[uid])
+    description = OMSK_ROUTES.get(route, "")
+    desc_line   = f"\n<i>{description}</i>" if description else ""
+    routes_list = ", ".join(f"<b>{r}</b>" for r in sorted(subscriptions[uid], key=lambda x: (len(x), x)))
+    await update.message.reply_html(
+        f"🔔 Маршрут <b>{route}</b>{desc_line}\n\n"
+        f"Слежение включено. Сейчас на линии: <b>{count} ТС</b>.\n"
+        f"Пришлю уведомление, когда появится новое.\n\n"
+        f"Отслеживаемых маршрутов ({total}): {routes_list}\n\n"
+        f"/stop {route} — снять этот\n"
+        f"/stop — снять все"
+    )
+
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6_371_000.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def nearest_stop_name(lat: float, lng: float, stops: list[dict]) -> Optional[str]:
+    if not stops:
+        return None
+    best = min(stops, key=lambda s: haversine_m(lat, lng, s["lat"], s["lng"]))
+    return best["name"]
+
+
+# ── Состояние бота ─────────────────────────────────────────────────
+
+# user_id -> set of route_numbers
+subscriptions: dict[int, set[str]] = defaultdict(set)
+
+# route_number -> set of u_id (ТС, которые уже были видны на карте)
+known_vehicles: dict[str, set] = defaultdict(set)
+
+# route_number -> mr_id (Navitrans internal ID)
+mr_id_cache: dict[str, str] = {}
+
+# mr_id -> список остановок с именами
+stops_cache: dict[str, list] = {}
+
+POLL_INTERVAL = 30  # секунд между проверками
+
+
+H = "HTML"  # parse_mode shortcut
+
+
+def _menu_text() -> str:
+    return (
+        "Что умею:\n\n"
+        "🔔 <b>Отслеживание</b> — получай уведомление, когда новое ТС\n"
+        "выходит на маршрут (данные ГЛОНАСС, bus-55.ru)\n\n"
+        "📍 <b>Где сейчас</b> — смотри геолокацию конкретного автобуса\n\n"
+        "<b>Команды:</b>\n"
+        "/track <i>номер</i> — начать отслеживать маршрут\n"
+        "/where <i>номер</i> — где сейчас ТС маршрута\n"
+        "/status — мои подписки\n"
+        "/stop <i>номер</i> — снять маршрут\n"
+        "/stop — снять все подписки\n"
+        "/help — это меню\n\n"
+        "💡 Можно просто написать номер маршрута — например: <b>212</b>"
+    )
+
+
+# ── Команды ────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    name = update.effective_user.first_name or "Привет"
+    await update.message.reply_html(
+        f"👋 <b>{name}!</b>\n\n"
+        f"Я бот мониторинга автобусов Омска.\n\n"
+        + _menu_text()
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_html(_menu_text())
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    routes = subscriptions.get(uid, set())
+    if not routes:
+        await update.message.reply_html(
+            "У тебя нет активных подписок.\n\n"
+            "Напиши номер маршрута или используй /track <i>номер</i>"
+        )
+        return
+
+    lines = []
+    for r in sorted(routes, key=lambda x: (len(x), x)):
+        known = len(known_vehicles.get(r, set()))
+        desc  = OMSK_ROUTES.get(r, "")
+        lines.append(
+            f"  🚌 <b>{r}</b> — {desc}\n"
+            f"       На линии сейчас: <b>{known} ТС</b>"
+        )
+
+    await update.message.reply_html(
+        f"🔔 <b>Отслеживаемые маршруты ({len(routes)}):</b>\n\n"
+        + "\n\n".join(lines)
+        + "\n\n"
+        "/stop <i>номер</i> — снять маршрут\n"
+        "/stop — снять все"
+    )
+
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    routes = subscriptions.get(uid, set())
+    if not routes:
+        await update.message.reply_html("У тебя нет активных подписок.")
+        return
+
+    if context.args:
+        route = context.args[0].strip().upper()
+        if route in routes:
+            routes.discard(route)
+            remaining = len(routes)
+            tail = f"\nОсталось подписок: <b>{remaining}</b>" if remaining else "\nВсе подписки сняты."
+            await update.message.reply_html(f"✅ Маршрут <b>{route}</b> снят с отслеживания.{tail}")
+        else:
+            active = ", ".join(f"<b>{r}</b>" for r in sorted(routes, key=lambda x: (len(x), x)))
+            await update.message.reply_html(
+                f"Маршрут <b>{route}</b> не отслеживается.\n"
+                f"Активные: {active}"
+            )
+    else:
+        subscriptions.pop(uid, None)
+        await update.message.reply_html("🛑 Слежение за всеми маршрутами остановлено.")
+
+
+async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_html("Укажи номер маршрута: /track <i>212</i>")
+        return
+    await subscribe(update, context.args[0])
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.message.text or "").strip()
+    if text:
+        await subscribe(update, text)
+
+
+# ── Где конкретное ТС ─────────────────────────────────────────────
+
+async def cmd_where(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_html("Укажи маршрут: /where <i>212</i>")
+        return
+
+    route = context.args[0].strip().upper()
+    msg = await update.message.reply_text(f"⏳ Загружаю ТС маршрута {route}...")
+
+    vehicles = fetch_vehicles()
+    route_vehicles = [
+        v for v in vehicles
+        if str(v.get("mr_num", "")).upper() == route
+        and v.get("u_lat") and v.get("u_long")
+    ]
+
+    if not route_vehicles:
+        await msg.edit_text(f"Маршрут {route}: сейчас нет ТС на линии.")
+        return
+
+    buttons = []
+    for v in route_vehicles:
+        plate = str(v.get("u_statenum", "") or "").strip() or "б/н"
+        uid_v = str(v.get("u_id", ""))
+        speed = int(float(v.get("u_speed", 0) or 0))
+        label = f"🚌 {plate}   {speed} км/ч"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"where:{uid_v}:{route}")])
+
+    description = OMSK_ROUTES.get(route, "")
+    header = f"📍 Маршрут <b>{route}</b>"
+    if description:
+        header += f"\n<i>{description}</i>"
+
+    await msg.edit_text(
+        header + f"\n\nНа линии <b>{len(route_vehicles)} ТС</b>. Выбери автобус:",
+        parse_mode=H,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def on_where_vehicle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    _, uid_v, route = query.data.split(":", 2)
+
+    vehicles = fetch_vehicles()
+    v = next(
+        (x for x in vehicles if str(x.get("u_id", "")) == uid_v),
+        None,
+    )
+
+    if not v:
+        await query.edit_message_text("ТС уже не на линии.")
+        return
+
+    lat   = float(v.get("u_lat",  0) or 0)
+    lng   = float(v.get("u_long", 0) or 0)
+    plate = str(v.get("u_statenum", "") or "").strip() or "б/н"
+    speed = int(float(v.get("u_speed", 0) or 0))
+    now   = datetime.now().strftime("%H:%M:%S")
+
+    # Ближайшая остановка
+    stop_name = "нет данных"
+    mr_id = mr_id_cache.get(route)
+    if not mr_id:
+        for x in vehicles:
+            if str(x.get("mr_num", "")).upper() == route:
+                mr_id = str(x.get("mr_id", ""))
+                if mr_id:
+                    mr_id_cache[route] = mr_id
+                    break
+    if mr_id:
+        if mr_id not in stops_cache:
+            stops_cache[mr_id] = fetch_route_stops(mr_id)
+        stops = stops_cache.get(mr_id, [])
+        if stops:
+            stop_name = nearest_stop_name(lat, lng, stops) or "нет данных"
+
+    description = OMSK_ROUTES.get(route, "")
+    desc_line   = f"\n<i>{description}</i>" if description else ""
+    caption = (
+        f"🚌 Маршрут <b>{route}</b>{desc_line}\n\n"
+        f"🚗 Госномер: <b>{plate}</b>\n"
+        f"🕐 Время: <b>{now}</b>\n"
+        f"⚡ Скорость: <b>{speed} км/ч</b>\n"
+        f"📍 Остановка: <b>{stop_name}</b>"
+    )
+
+    await query.edit_message_text(caption, parse_mode=H)
+    await context.bot.send_location(
+        chat_id=query.message.chat_id,
+        latitude=lat,
+        longitude=lng,
+    )
+
+
+# ── Фоновый опрос ──────────────────────────────────────────────────
+
+async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Запускается каждые POLL_INTERVAL секунд."""
+    if not subscriptions:
+        return
+
+    watched: set[str] = set()
+    for routes in subscriptions.values():
+        watched |= routes
+    if not watched:
+        return
+
+    try:
+        vehicles = fetch_vehicles()
+    except Exception as e:
+        log.warning("poll_job: ошибка при получении ТС: %s", e)
+        return
+
+    # Обновляем mr_id из живых данных
+    for v in vehicles:
+        mr_num = str(v.get("mr_num", ""))
+        mr_id  = str(v.get("mr_id", ""))
+        if mr_num and mr_id and mr_num not in mr_id_cache:
+            mr_id_cache[mr_num] = mr_id
+
+    # Группируем по маршруту
+    by_route: dict[str, list[dict]] = defaultdict(list)
+    for v in vehicles:
+        mr_num = str(v.get("mr_num", ""))
+        if mr_num in watched:
+            by_route[mr_num].append(v)
+
+    for uid, user_routes in list(subscriptions.items()):
+        for route in list(user_routes):
+            current_list = by_route.get(route, [])
+            current_ids  = {str(v.get("u_id", "")) for v in current_list if v.get("u_id")}
+            prev_ids     = known_vehicles.get(route, set())
+            new_ids      = current_ids - prev_ids
+            known_vehicles[route] = current_ids
+
+            for vid in new_ids:
+                v = next((x for x in current_list if str(x.get("u_id", "")) == vid), None)
+                if not v:
+                    continue
+
+                plate = str(v.get("u_statenum", "") or "").strip() or "нет данных"
+                lat   = float(v.get("u_lat",   0) or 0)
+                lng   = float(v.get("u_long",  0) or 0)
+                now   = datetime.now().strftime("%H:%M:%S")
+
+                stop_name = "нет данных"
+                mr_id = mr_id_cache.get(route)
+                if mr_id:
+                    if mr_id not in stops_cache:
+                        stops_cache[mr_id] = fetch_route_stops(mr_id)
+                    stops = stops_cache.get(mr_id, [])
+                    if stops and lat and lng:
+                        stop_name = nearest_stop_name(lat, lng, stops) or "нет данных"
+
+                text = (
+                    f"🚌 Маршрут {route} — новое ТС на линии\n"
+                    f"🚗 Госномер: {plate}\n"
+                    f"🕐 Время: {now}\n"
+                    f"📍 Остановка: {stop_name}"
+                )
+                try:
+                    await context.bot.send_message(chat_id=uid, text=text)
+                except Exception as e:
+                    log.warning("send_message uid=%s: %s", uid, e)
+
+
+# ── Health-check сервер (для Render / UptimeRobot) ─────────────────
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, *args):
+        pass  # не засорять лог
+
+
+def _start_health_server() -> None:
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info("Health-check сервер запущен на порту %d", port)
+
+
+# ── Запуск ─────────────────────────────────────────────────────────
+
+def main() -> None:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError(
+            "Токен не задан. Установи переменную окружения TELEGRAM_BOT_TOKEN.\n"
+            "Пример: set TELEGRAM_BOT_TOKEN=1234567890:AAFxxx..."
+        )
+
+    async def post_init(application):
+        await application.bot.set_my_commands([
+            BotCommand("track",  "Отслеживать маршрут — /track 212"),
+            BotCommand("where",  "Где сейчас ТС маршрута — /where 212"),
+            BotCommand("status", "Мои подписки"),
+            BotCommand("stop",   "Снять маршрут — /stop 212 или все"),
+            BotCommand("help",   "Справка по командам"),
+            BotCommand("start",  "Начало работы"),
+        ])
+
+    _start_health_server()
+    app = Application.builder().token(token).post_init(post_init).build()
+
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("help",   cmd_help))
+    app.add_handler(CommandHandler("track",  cmd_track))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("stop",   cmd_stop))
+    app.add_handler(CommandHandler("where",  cmd_where))
+    app.add_handler(CallbackQueryHandler(on_where_vehicle, pattern=r"^where:"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    app.job_queue.run_repeating(poll_job, interval=POLL_INTERVAL, first=15)
+
+    log.info("Бот запущен. Интервал опроса: %d сек.", POLL_INTERVAL)
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
