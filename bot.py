@@ -559,6 +559,37 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await subscribe(update, text)
 
 
+# ── Диагностика API ───────────────────────────────────────────────
+
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    route = (context.args[0].strip().upper() if context.args else "").strip()
+    msg = await update.message.reply_text("⏳ Запрашиваю API...")
+
+    vehicles = fetch_vehicles()
+    total = len(vehicles)
+
+    if total == 0:
+        await msg.edit_text("❌ API вернул 0 ТС — сессия не открылась или временный сбой.")
+        return
+
+    all_nums = sorted({str(v.get("mr_num", "")).strip() for v in vehicles if v.get("mr_num")})
+    matched = [v for v in vehicles if str(v.get("mr_num", "")).strip().upper() == route] if route else []
+
+    sample = ", ".join(all_nums[:40])
+    text = (
+        f"🔍 Всего ТС из API: <b>{total}</b>\n"
+        f"Уникальных маршрутов: <b>{len(all_nums)}</b>\n"
+        f"Примеры mr_num: <code>{sample}</code>"
+    )
+    if route:
+        text += f"\n\nМаршрут <b>{route}</b>: найдено <b>{len(matched)} ТС</b>"
+        if matched:
+            plates = ", ".join(str(v.get("u_statenum", "б/н") or "б/н") for v in matched[:5])
+            text += f"\nГосномера: {plates}"
+
+    await msg.edit_text(text, parse_mode=H)
+
+
 # ── Где конкретное ТС ─────────────────────────────────────────────
 
 async def cmd_where(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -787,6 +818,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("stop",   cmd_stop))
     app.add_handler(CommandHandler("where",  cmd_where))
+    app.add_handler(CommandHandler("debug",  cmd_debug))
     app.add_handler(CallbackQueryHandler(on_where_vehicle, pattern=r"^where:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
