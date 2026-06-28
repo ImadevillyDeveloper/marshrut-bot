@@ -124,13 +124,12 @@ def fetch_vehicles() -> list[dict]:
             if not sid:
                 return []
             rid = _next_id()
-            # Сначала пробуем без подписанного URL (как startSession) —
-            # подписанный эндпоинт ?m=... может быть заблокирован по IP.
-            r = http.post(BUS55_BASE, headers=BUS55_HEADERS, json={
+            url, magic = _sign("getUnitsInRect", rid, sid)
+            r = http.post(url, headers=BUS55_HEADERS, json={
                 "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
                 "ts": _ts(), "id": rid,
                 "params": {
-                    "sid": sid,
+                    "sid": sid, "magic": magic,
                     "minlat": 54.80, "maxlat": 55.15,
                     "minlong": 73.10, "maxlong": 73.70,
                 },
@@ -604,32 +603,19 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Тест 1: без подписи (базовый URL)
-    await msg.edit_text("✅ Сессия OK. Тестирую запросы...", parse_mode=H)
+    await msg.edit_text("✅ Сессия OK. Запрашиваю ТС...", parse_mode=H)
     sid2 = _get_sid()
     rid2 = _next_id()
+    url2, magic2 = _sign("getUnitsInRect", rid2, sid2)
     try:
-        r2 = http.post(BUS55_BASE, headers=BUS55_HEADERS, json={
+        r2 = http.post(url2, headers=BUS55_HEADERS, json={
             "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
             "ts": _ts(), "id": rid2,
-            "params": {"sid": sid2, "minlat": 54.80, "maxlat": 55.15, "minlong": 73.10, "maxlong": 73.70},
-        }, timeout=10)
-        rect_unsigned = f"HTTP {r2.status_code} — <code>{r2.text[:200]}</code>"
-    except Exception as e:
-        rect_unsigned = f"Исключение: <code>{e}</code>"
-
-    # Тест 2: с подписью (?m=...)
-    rid3 = _next_id()
-    url3, magic3 = _sign("getUnitsInRect", rid3, sid2)
-    try:
-        r3 = http.post(url3, headers=BUS55_HEADERS, json={
-            "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
-            "ts": _ts(), "id": rid3,
-            "params": {"sid": sid2, "magic": magic3, "minlat": 54.80, "maxlat": 55.15, "minlong": 73.10, "maxlong": 73.70},
+            "params": {"sid": sid2, "magic": magic2, "minlat": 54.80, "maxlat": 55.15, "minlong": 73.10, "maxlong": 73.70},
         }, timeout=12)
-        rect_signed = f"HTTP {r3.status_code} — <code>{r3.text[:200]}</code>"
+        rect_line = f"HTTP {r2.status_code} — <code>{r2.text[:400]}</code>"
     except Exception as e:
-        rect_signed = f"Исключение: <code>{e}</code>"
+        rect_line = f"Исключение: <code>{e}</code>"
 
     vehicles = fetch_vehicles()
     total = len(vehicles)
@@ -638,8 +624,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.edit_text(
             f"⚠️ Сессия открылась, но getUnitsInRect вернул 0 ТС.\n\n"
             f"<b>startSession:</b>\n{session_line}\n\n"
-            f"<b>без подписи:</b>\n{rect_unsigned}\n\n"
-            f"<b>с подписью (?m=...):</b>\n{rect_signed}",
+            f"<b>getUnitsInRect:</b>\n{rect_line}",
             parse_mode=H,
         )
         return
