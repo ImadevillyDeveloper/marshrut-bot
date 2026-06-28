@@ -587,9 +587,127 @@ async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (update.message.text or "").strip()
-    if text:
-        await subscribe(update, text)
+    route = (update.message.text or "").strip().upper()
+    if not route:
+        return
+
+    if route not in OMSK_ROUTES:
+        close = [r for r in OMSK_ROUTES if r.startswith(route[:2])] if len(route) >= 2 else []
+        hint  = ("\n\nПохожие: " + ", ".join(f"<b>{r}</b>" for r in sorted(close)[:5])) if close else ""
+        await update.message.reply_html(
+            f"❌ Маршрут <b>{route}</b> не найден в списке омских маршрутов.{hint}\n\n"
+            f"Напиши точный номер, например: <b>24</b>, <b>55</b>, <b>212</b>"
+        )
+        return
+
+    description = OMSK_ROUTES.get(route, "")
+    desc_line   = f"\n<i>{description}</i>" if description else ""
+    uid = update.effective_user.id
+    already = route in subscriptions.get(uid, set())
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "✅ Уже отслеживается" if already else "🔔 Отслеживать",
+            callback_data=f"route:track:{route}",
+        ),
+        InlineKeyboardButton("📍 ТС на линии", callback_data=f"route:where:{route}"),
+    ]])
+    await update.message.reply_html(
+        f"Маршрут <b>{route}</b>{desc_line}\n\nЧто сделать?",
+        reply_markup=keyboard,
+    )
+
+
+async def on_route_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    _, action, route = query.data.split(":", 2)
+    uid = query.from_user.id
+
+    if action == "track":
+        # Логика подписки (аналог subscribe(), но редактирует сообщение)
+        vehicles = fetch_vehicles()
+        for v in vehicles:
+            if str(v.get("mr_num", "")).strip().upper() == route:
+                mid = str(v.get("mr_id", "")).strip()
+                if mid:
+                    mr_id_cache[route] = mid
+                    break
+        if route not in mr_id_cache:
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                row  = conn.execute(
+                    "SELECT mr_id FROM route_navitrans_ids WHERE route_number = ?", (route,)
+                ).fetchone()
+                conn.close()
+                if row:
+                    mr_id_cache[route] = str(row[0])
+            except Exception:
+                pass
+        if route in mr_id_cache:
+            mid = mr_id_cache[route]
+            if mid not in stops_cache:
+                stops_cache[mid] = fetch_route_stops(mid)
+
+        current_ids = {
+            str(v.get("u_id", ""))
+            for v in vehicles
+            if str(v.get("mr_num", "")).strip().upper() == route and v.get("u_id")
+        }
+        known_vehicles[route] = current_ids
+        subscriptions[uid].add(route)
+        db_add_sub(uid, route)
+
+        count       = len(current_ids)
+        total       = len(subscriptions[uid])
+        description = OMSK_ROUTES.get(route, "")
+        desc_line   = f"\n<i>{description}</i>" if description else ""
+        routes_list = ", ".join(
+            f"<b>{r}</b>" for r in sorted(subscriptions[uid], key=lambda x: (len(x), x))
+        )
+        await query.edit_message_text(
+            f"🔔 Маршрут <b>{route}</b>{desc_line}\n\n"
+            f"Слежение включено. Сейчас на линии: <b>{count} ТС</b>.\n"
+            f"Пришлю уведомление, когда появится новое.\n\n"
+            f"Отслеживаемых маршрутов ({total}): {routes_list}\n\n"
+            f"/stop {route} — снять этот\n/stop — снять все",
+            parse_mode=H,
+        )
+
+    elif action == "where":
+        await query.edit_message_text("⏳ Загружаю ТС...", parse_mode=H)
+        vehicles = fetch_vehicles()
+        route_vehicles = [
+            v for v in vehicles
+            if str(v.get("mr_num", "")).strip().upper() == route
+            and v.get("u_lat") and v.get("u_long")
+        ]
+        description = OMSK_ROUTES.get(route, "")
+        header = f"📍 Маршрут <b>{route}</b>"
+        if description:
+            header += f"\n<i>{description}</i>"
+
+        if not route_vehicles:
+            await query.edit_message_text(header + "\n\nСейчас нет ТС на линии.", parse_mode=H)
+            return
+
+        buttons = []
+        for v in route_vehicles:
+            plate    = str(v.get("u_statenum", "") or "").strip() or "б/н"
+            uid_v    = str(v.get("u_id", ""))
+            speed    = int(float(v.get("u_speed", 0) or 0))
+            terminal = str(v.get("rl_laststation_title", "") or "").strip()
+            label    = f"🚌 {plate}  {speed} км/ч"
+            if terminal:
+                label += f"  → {terminal}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"where:{uid_v}:{route}")])
+
+        await query.edit_message_text(
+            header + f"\n\nНа линии <b>{len(route_vehicles)} ТС</b>. Выбери автобус:",
+            parse_mode=H,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
 
 
 # ── Диагностика API ───────────────────────────────────────────────
@@ -931,6 +1049,7 @@ def main() -> None:
     app.add_handler(CommandHandler("stop",   cmd_stop))
     app.add_handler(CommandHandler("where",  cmd_where))
     app.add_handler(CommandHandler("debug",  cmd_debug))
+    app.add_handler(CallbackQueryHandler(on_route_action,  pattern=r"^route:"))
     app.add_handler(CallbackQueryHandler(on_where_vehicle, pattern=r"^where:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
