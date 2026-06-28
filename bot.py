@@ -685,12 +685,13 @@ async def cmd_where(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     buttons = []
     for v in route_vehicles:
-        plate  = str(v.get("u_statenum", "") or "").strip() or "б/н"
-        uid_v  = str(v.get("u_id", ""))
-        speed  = int(float(v.get("u_speed", 0) or 0))
-        course = v.get("u_course")
-        arrow  = f" {course_to_arrow(float(course))}" if course is not None else ""
-        label  = f"🚌 {plate}   {speed} км/ч{arrow}"
+        plate    = str(v.get("u_statenum", "") or "").strip() or "б/н"
+        uid_v    = str(v.get("u_id", ""))
+        speed    = int(float(v.get("u_speed", 0) or 0))
+        terminal = str(v.get("rl_laststation_title", "") or "").strip()
+        label    = f"🚌 {plate}  {speed} км/ч"
+        if terminal:
+            label += f"  → {terminal}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"where:{uid_v}:{route}")])
 
     description = OMSK_ROUTES.get(route, "")
@@ -745,12 +746,8 @@ async def on_where_vehicle(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if stops:
             stop_name = nearest_stop_name(lat, lng, stops) or "нет данных"
 
-    direction_line = ""
-    if course is not None:
-        try:
-            direction_line = f"\n🧭 Направление: <b>{course_to_arrow(float(course))} {course_to_str(float(course))}</b>"
-        except Exception:
-            pass
+    terminal = str(v.get("rl_laststation_title", "") or "").strip()
+    terminal_line = f"\n🏁 В сторону: <b>{terminal}</b>" if terminal else ""
 
     description = OMSK_ROUTES.get(route, "")
     desc_line   = f"\n<i>{description}</i>" if description else ""
@@ -760,7 +757,7 @@ async def on_where_vehicle(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"🕐 Время: <b>{now}</b>\n"
         f"⚡ Скорость: <b>{speed} км/ч</b>\n"
         f"📍 Остановка: <b>{stop_name}</b>"
-        f"{direction_line}"
+        f"{terminal_line}"
     )
 
     await query.edit_message_text(caption, parse_mode=H)
@@ -841,13 +838,15 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             now = datetime.now().strftime("%H:%M:%S")
 
             for v in new_by_route.get(route, []):
-                plate = str(v.get("u_statenum", "") or "").strip() or "нет данных"
+                plate    = str(v.get("u_statenum", "") or "").strip() or "нет данных"
+                terminal = str(v.get("rl_laststation_title", "") or "").strip()
                 stop_name = _stop_for(v, route)
                 text = (
                     f"🟢 Маршрут {route} — новое ТС на линии\n"
                     f"🚗 Госномер: {plate}\n"
                     f"🕐 Время: {now}\n"
                     f"📍 Остановка: {stop_name}"
+                    + (f"\n🏁 В сторону: {terminal}" if terminal else "")
                 )
                 try:
                     await context.bot.send_message(chat_id=uid, text=text)
@@ -855,17 +854,10 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     log.warning("send_message uid=%s: %s", uid, e)
 
             for v in gone_by_route.get(route, []):
-                plate  = str(v.get("u_statenum", "") or "").strip() or "нет данных"
-                speed  = int(float(v.get("u_speed", 0) or 0))
-                course = v.get("u_course")
+                plate    = str(v.get("u_statenum", "") or "").strip() or "нет данных"
+                speed    = int(float(v.get("u_speed", 0) or 0))
+                terminal = str(v.get("rl_laststation_title", "") or "").strip()
                 stop_name = _stop_for(v, route)
-
-                direction = ""
-                if course is not None:
-                    try:
-                        direction = f"\n🧭 Направление: {course_to_str(float(course))}"
-                    except Exception:
-                        pass
 
                 text = (
                     f"🔴 Маршрут {route} — ТС сошло с линии\n"
@@ -873,7 +865,7 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     f"🕐 Время: {now}\n"
                     f"📍 Последняя остановка: {stop_name}\n"
                     f"⚡ Скорость: {speed} км/ч"
-                    f"{direction}"
+                    + (f"\n🏁 Ехало в сторону: {terminal}" if terminal else "")
                 )
                 try:
                     await context.bot.send_message(chat_id=uid, text=text)
