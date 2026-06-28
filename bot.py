@@ -124,22 +124,24 @@ def fetch_vehicles() -> list[dict]:
             if not sid:
                 return []
             rid = _next_id()
-            url, magic = _sign("getUnitsInRect", rid, sid)
-            r = http.post(url, headers=BUS55_HEADERS, json={
+            # Сначала пробуем без подписанного URL (как startSession) —
+            # подписанный эндпоинт ?m=... может быть заблокирован по IP.
+            r = http.post(BUS55_BASE, headers=BUS55_HEADERS, json={
                 "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
                 "ts": _ts(), "id": rid,
                 "params": {
-                    "sid": sid, "magic": magic,
+                    "sid": sid,
                     "minlat": 54.80, "maxlat": 55.15,
                     "minlong": 73.10, "maxlong": 73.70,
                 },
-            }, timeout=8)
+            }, timeout=10)
             data = r.json()
             if "error" in data:
                 code = data["error"].get("code", 0)
                 if code == -33100 and attempt == 0:
                     _session["sid"] = None
                     continue
+                log.warning("fetch_vehicles error: %s", data["error"])
                 return []
             result = data.get("result", [])
             return result if isinstance(result, list) else []
@@ -607,12 +609,11 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         sid2 = _get_sid()
         rid2 = _next_id()
-        url2, magic2 = _sign("getUnitsInRect", rid2, sid2)
-        r2 = http.post(url2, headers=BUS55_HEADERS, json={
+        r2 = http.post(BUS55_BASE, headers=BUS55_HEADERS, json={
             "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
             "ts": _ts(), "id": rid2,
             "params": {
-                "sid": sid2, "magic": magic2,
+                "sid": sid2,
                 "minlat": 54.80, "maxlat": 55.15,
                 "minlong": 73.10, "maxlong": 73.70,
             },
