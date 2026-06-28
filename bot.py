@@ -372,10 +372,11 @@ async def subscribe(update: Update, route: str) -> None:
     route = route.strip().upper()
 
     vehicles = fetch_vehicles()
+    log.info("subscribe route=%s: fetch_vehicles вернул %d ТС", route, len(vehicles))
 
     for v in vehicles:
-        if str(v.get("mr_num", "")).upper() == route:
-            mid = str(v.get("mr_id", ""))
+        if str(v.get("mr_num", "")).strip().upper() == route:
+            mid = str(v.get("mr_id", "")).strip()
             if mid:
                 mr_id_cache[route] = mid
                 break
@@ -400,8 +401,9 @@ async def subscribe(update: Update, route: str) -> None:
     current_ids = {
         str(v.get("u_id", ""))
         for v in vehicles
-        if str(v.get("mr_num", "")).upper() == route and v.get("u_id")
+        if str(v.get("mr_num", "")).strip().upper() == route and v.get("u_id")
     }
+    log.info("subscribe route=%s: найдено %d ТС на маршруте", route, len(current_ids))
     known_vehicles[route] = current_ids
     subscriptions[uid].add(route)
     db_add_sub(uid, route)
@@ -570,7 +572,7 @@ async def cmd_where(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     vehicles = fetch_vehicles()
     route_vehicles = [
         v for v in vehicles
-        if str(v.get("mr_num", "")).upper() == route
+        if str(v.get("mr_num", "")).strip().upper() == route
         and v.get("u_lat") and v.get("u_long")
     ]
 
@@ -625,8 +627,8 @@ async def on_where_vehicle(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     mr_id = mr_id_cache.get(route)
     if not mr_id:
         for x in vehicles:
-            if str(x.get("mr_num", "")).upper() == route:
-                mr_id = str(x.get("mr_id", ""))
+            if str(x.get("mr_num", "")).strip().upper() == route:
+                mr_id = str(x.get("mr_id", "")).strip()
                 if mr_id:
                     mr_id_cache[route] = mr_id
                     break
@@ -676,15 +678,15 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Обновляем mr_id из живых данных
     for v in vehicles:
-        mr_num = str(v.get("mr_num", ""))
-        mr_id  = str(v.get("mr_id", ""))
+        mr_num = str(v.get("mr_num", "")).strip().upper()
+        mr_id  = str(v.get("mr_id", "")).strip()
         if mr_num and mr_id and mr_num not in mr_id_cache:
             mr_id_cache[mr_num] = mr_id
 
     # Группируем по маршруту
     by_route: dict[str, list[dict]] = defaultdict(list)
     for v in vehicles:
-        mr_num = str(v.get("mr_num", ""))
+        mr_num = str(v.get("mr_num", "")).strip().upper()
         if mr_num in watched:
             by_route[mr_num].append(v)
 
