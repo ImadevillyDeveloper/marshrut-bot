@@ -377,6 +377,18 @@ async def subscribe(update: Update, route: str) -> None:
     uid = update.effective_user.id
     route = route.strip().upper()
 
+    if route not in OMSK_ROUTES:
+        hint = ""
+        # Подсказка: ищем похожий маршрут
+        close = [r for r in OMSK_ROUTES if r.startswith(route[:2])] if len(route) >= 2 else []
+        if close:
+            hint = "\n\nПохожие: " + ", ".join(f"<b>{r}</b>" for r in sorted(close)[:5])
+        await update.message.reply_html(
+            f"❌ Маршрут <b>{route}</b> не найден в списке омских маршрутов.{hint}\n\n"
+            f"Напиши точный номер, например: <b>24</b>, <b>55</b>, <b>212</b>"
+        )
+        return
+
     vehicles = fetch_vehicles()
     log.info("subscribe route=%s: fetch_vehicles вернул %d ТС", route, len(vehicles))
 
@@ -569,13 +581,35 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     route = (context.args[0].strip().upper() if context.args else "").strip()
-    msg = await update.message.reply_text("⏳ Запрашиваю API...")
+    msg = await update.message.reply_text("⏳ Тестирую сессию API...")
+
+    # Тест startSession напрямую — показываем сырой ответ в боте
+    try:
+        r = http.post(BUS55_BASE, headers=BUS55_HEADERS, json={
+            "jsonrpc": BUS55_RPC, "method": "startSession",
+            "ts": _ts(), "params": {}, "id": 1,
+        }, timeout=8)
+        session_line = f"HTTP {r.status_code} — <code>{r.text[:300]}</code>"
+        session_ok = "sid" in r.text
+    except Exception as e:
+        session_line = f"Исключение: <code>{e}</code>"
+        session_ok = False
+
+    if not session_ok:
+        await msg.edit_text(
+            f"❌ startSession провалился\n\n{session_line}",
+            parse_mode=H,
+        )
+        return
 
     vehicles = fetch_vehicles()
     total = len(vehicles)
 
     if total == 0:
-        await msg.edit_text("❌ API вернул 0 ТС — сессия не открылась или временный сбой.")
+        await msg.edit_text(
+            f"⚠️ Сессия открылась, но getUnitsInRect вернул 0 ТС.\n\n{session_line}",
+            parse_mode=H,
+        )
         return
 
     all_nums = sorted({str(v.get("mr_num", "")).strip() for v in vehicles if v.get("mr_num")})
@@ -583,7 +617,8 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     sample = ", ".join(all_nums[:40])
     text = (
-        f"🔍 Всего ТС из API: <b>{total}</b>\n"
+        f"✅ Сессия OK\n"
+        f"Всего ТС из API: <b>{total}</b>\n"
         f"Уникальных маршрутов: <b>{len(all_nums)}</b>\n"
         f"Примеры mr_num: <code>{sample}</code>"
     )
