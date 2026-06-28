@@ -464,6 +464,11 @@ def course_to_str(course: float) -> str:
     return dirs[round(course / 45) % 8]
 
 
+def course_to_arrow(course: float) -> str:
+    arrows = ["↑", "↗", "→", "↘", "↓", "↙", "←", "↖"]
+    return arrows[round(course / 45) % 8]
+
+
 # ── Состояние бота ─────────────────────────────────────────────────
 
 # user_id -> set of route_numbers
@@ -680,10 +685,12 @@ async def cmd_where(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     buttons = []
     for v in route_vehicles:
-        plate = str(v.get("u_statenum", "") or "").strip() or "б/н"
-        uid_v = str(v.get("u_id", ""))
-        speed = int(float(v.get("u_speed", 0) or 0))
-        label = f"🚌 {plate}   {speed} км/ч"
+        plate  = str(v.get("u_statenum", "") or "").strip() or "б/н"
+        uid_v  = str(v.get("u_id", ""))
+        speed  = int(float(v.get("u_speed", 0) or 0))
+        course = v.get("u_course")
+        arrow  = f" {course_to_arrow(float(course))}" if course is not None else ""
+        label  = f"🚌 {plate}   {speed} км/ч{arrow}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"where:{uid_v}:{route}")])
 
     description = OMSK_ROUTES.get(route, "")
@@ -714,11 +721,12 @@ async def on_where_vehicle(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text("ТС уже не на линии.")
         return
 
-    lat   = float(v.get("u_lat",  0) or 0)
-    lng   = float(v.get("u_long", 0) or 0)
-    plate = str(v.get("u_statenum", "") or "").strip() or "б/н"
-    speed = int(float(v.get("u_speed", 0) or 0))
-    now   = datetime.now().strftime("%H:%M:%S")
+    lat    = float(v.get("u_lat",  0) or 0)
+    lng    = float(v.get("u_long", 0) or 0)
+    plate  = str(v.get("u_statenum", "") or "").strip() or "б/н"
+    speed  = int(float(v.get("u_speed", 0) or 0))
+    course = v.get("u_course")
+    now    = datetime.now().strftime("%H:%M:%S")
 
     # Ближайшая остановка
     stop_name = "нет данных"
@@ -737,6 +745,13 @@ async def on_where_vehicle(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if stops:
             stop_name = nearest_stop_name(lat, lng, stops) or "нет данных"
 
+    direction_line = ""
+    if course is not None:
+        try:
+            direction_line = f"\n🧭 Направление: <b>{course_to_arrow(float(course))} {course_to_str(float(course))}</b>"
+        except Exception:
+            pass
+
     description = OMSK_ROUTES.get(route, "")
     desc_line   = f"\n<i>{description}</i>" if description else ""
     caption = (
@@ -745,6 +760,7 @@ async def on_where_vehicle(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"🕐 Время: <b>{now}</b>\n"
         f"⚡ Скорость: <b>{speed} км/ч</b>\n"
         f"📍 Остановка: <b>{stop_name}</b>"
+        f"{direction_line}"
     )
 
     await query.edit_message_text(caption, parse_mode=H)
