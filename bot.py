@@ -602,12 +602,33 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    # Тест getUnitsInRect напрямую — показываем сырой ответ
+    await msg.edit_text("✅ Сессия OK. Запрашиваю ТС...", parse_mode=H)
+    try:
+        sid2 = _get_sid()
+        rid2 = _next_id()
+        url2, magic2 = _sign("getUnitsInRect", rid2, sid2)
+        r2 = http.post(url2, headers=BUS55_HEADERS, json={
+            "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
+            "ts": _ts(), "id": rid2,
+            "params": {
+                "sid": sid2, "magic": magic2,
+                "minlat": 54.80, "maxlat": 55.15,
+                "minlong": 73.10, "maxlong": 73.70,
+            },
+        }, timeout=10)
+        rect_line = f"HTTP {r2.status_code} — <code>{r2.text[:400]}</code>"
+    except Exception as e:
+        rect_line = f"Исключение: <code>{e}</code>"
+
     vehicles = fetch_vehicles()
     total = len(vehicles)
 
     if total == 0:
         await msg.edit_text(
-            f"⚠️ Сессия открылась, но getUnitsInRect вернул 0 ТС.\n\n{session_line}",
+            f"⚠️ Сессия открылась, но getUnitsInRect вернул 0 ТС.\n\n"
+            f"<b>startSession:</b>\n{session_line}\n\n"
+            f"<b>getUnitsInRect:</b>\n{rect_line}",
             parse_mode=H,
         )
         return
