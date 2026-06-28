@@ -604,23 +604,32 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Тест getUnitsInRect напрямую — показываем сырой ответ
-    await msg.edit_text("✅ Сессия OK. Запрашиваю ТС...", parse_mode=H)
+    # Тест 1: без подписи (базовый URL)
+    await msg.edit_text("✅ Сессия OK. Тестирую запросы...", parse_mode=H)
+    sid2 = _get_sid()
+    rid2 = _next_id()
     try:
-        sid2 = _get_sid()
-        rid2 = _next_id()
         r2 = http.post(BUS55_BASE, headers=BUS55_HEADERS, json={
             "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
             "ts": _ts(), "id": rid2,
-            "params": {
-                "sid": sid2,
-                "minlat": 54.80, "maxlat": 55.15,
-                "minlong": 73.10, "maxlong": 73.70,
-            },
+            "params": {"sid": sid2, "minlat": 54.80, "maxlat": 55.15, "minlong": 73.10, "maxlong": 73.70},
         }, timeout=10)
-        rect_line = f"HTTP {r2.status_code} — <code>{r2.text[:400]}</code>"
+        rect_unsigned = f"HTTP {r2.status_code} — <code>{r2.text[:200]}</code>"
     except Exception as e:
-        rect_line = f"Исключение: <code>{e}</code>"
+        rect_unsigned = f"Исключение: <code>{e}</code>"
+
+    # Тест 2: с подписью (?m=...)
+    rid3 = _next_id()
+    url3, magic3 = _sign("getUnitsInRect", rid3, sid2)
+    try:
+        r3 = http.post(url3, headers=BUS55_HEADERS, json={
+            "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
+            "ts": _ts(), "id": rid3,
+            "params": {"sid": sid2, "magic": magic3, "minlat": 54.80, "maxlat": 55.15, "minlong": 73.10, "maxlong": 73.70},
+        }, timeout=12)
+        rect_signed = f"HTTP {r3.status_code} — <code>{r3.text[:200]}</code>"
+    except Exception as e:
+        rect_signed = f"Исключение: <code>{e}</code>"
 
     vehicles = fetch_vehicles()
     total = len(vehicles)
@@ -629,7 +638,8 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.edit_text(
             f"⚠️ Сессия открылась, но getUnitsInRect вернул 0 ТС.\n\n"
             f"<b>startSession:</b>\n{session_line}\n\n"
-            f"<b>getUnitsInRect:</b>\n{rect_line}",
+            f"<b>без подписи:</b>\n{rect_unsigned}\n\n"
+            f"<b>с подписью (?m=...):</b>\n{rect_signed}",
             parse_mode=H,
         )
         return
