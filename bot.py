@@ -81,12 +81,18 @@ def _start_session() -> Optional[str]:
             "jsonrpc": BUS55_RPC, "method": "startSession",
             "ts": _ts(), "params": {}, "id": 1,
         }, timeout=6)
-        sid = r.json()["result"]["sid"]
+        log.info("startSession HTTP %d: %s", r.status_code, r.text[:300])
+        data = r.json()
+        if "error" in data:
+            log.warning("startSession ошибка API: %s", data["error"])
+            return None
+        sid = data["result"]["sid"]
         _session["sid"] = sid
         _session["exp"] = time.time() + 3500
+        log.info("startSession OK, sid=%s", sid[:8])
         return sid
     except Exception as e:
-        log.warning("Сессия Navitrans не открылась: %s", e)
+        log.warning("startSession исключение: %s", e)
         return None
 
 
