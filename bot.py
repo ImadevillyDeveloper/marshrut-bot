@@ -145,6 +145,63 @@ def fetch_vehicles() -> list[dict]:
     return []
 
 
+def init_db() -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            user_id INTEGER NOT NULL,
+            route   TEXT    NOT NULL,
+            PRIMARY KEY (user_id, route)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def db_load_subscriptions() -> dict:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute("SELECT user_id, route FROM subscriptions").fetchall()
+        conn.close()
+        result: dict[int, set[str]] = defaultdict(set)
+        for uid, route in rows:
+            result[uid].add(route)
+        return result
+    except Exception as e:
+        log.warning("db_load_subscriptions: %s", e)
+        return defaultdict(set)
+
+
+def db_add_sub(uid: int, route: str) -> None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("INSERT OR IGNORE INTO subscriptions (user_id, route) VALUES (?, ?)", (uid, route))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning("db_add_sub: %s", e)
+
+
+def db_remove_sub(uid: int, route: str) -> None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("DELETE FROM subscriptions WHERE user_id = ? AND route = ?", (uid, route))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning("db_remove_sub: %s", e)
+
+
+def db_remove_all_subs(uid: int) -> None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("DELETE FROM subscriptions WHERE user_id = ?", (uid,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning("db_remove_all_subs: %s", e)
+
+
 def fetch_route_stops(mr_id: str) -> list[dict]:
     """Список остановок маршрута с именами: [{name, lat, lng}, ...]."""
     try:
@@ -347,6 +404,7 @@ async def subscribe(update: Update, route: str) -> None:
     }
     known_vehicles[route] = current_ids
     subscriptions[uid].add(route)
+    db_add_sub(uid, route)
 
     count = len(current_ids)
     total = len(subscriptions[uid])
@@ -470,6 +528,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         route = context.args[0].strip().upper()
         if route in routes:
             routes.discard(route)
+            db_remove_sub(uid, route)
             remaining = len(routes)
             tail = f"\nОсталось подписок: <b>{remaining}</b>" if remaining else "\nВсе подписки сняты."
             await update.message.reply_html(f"✅ Маршрут <b>{route}</b> снят с отслеживания.{tail}")
@@ -481,6 +540,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
     else:
         subscriptions.pop(uid, None)
+        db_remove_all_subs(uid)
         await update.message.reply_html("🛑 Слежение за всеми маршрутами остановлено.")
 
 
@@ -628,19 +688,20 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if mr_num in watched:
             by_route[mr_num].append(v)
 
+    # Определяем новые ТС по каждому маршруту один раз — до рассылки,
+    # чтобы все подписчики получили одинаковый список новинок.
+    new_by_route: dict[str, list[dict]] = {}
+    for route in watched:
+        current_list = by_route.get(route, [])
+        current_ids  = {str(v.get("u_id", "")) for v in current_list if v.get("u_id")}
+        prev_ids     = known_vehicles.get(route, set())
+        new_ids      = current_ids - prev_ids
+        known_vehicles[route] = current_ids
+        new_by_route[route] = [v for v in current_list if str(v.get("u_id", "")) in new_ids]
+
     for uid, user_routes in list(subscriptions.items()):
         for route in list(user_routes):
-            current_list = by_route.get(route, [])
-            current_ids  = {str(v.get("u_id", "")) for v in current_list if v.get("u_id")}
-            prev_ids     = known_vehicles.get(route, set())
-            new_ids      = current_ids - prev_ids
-            known_vehicles[route] = current_ids
-
-            for vid in new_ids:
-                v = next((x for x in current_list if str(x.get("u_id", "")) == vid), None)
-                if not v:
-                    continue
-
+            for v in new_by_route.get(route, []):
                 plate = str(v.get("u_statenum", "") or "").strip() or "нет данных"
                 lat   = float(v.get("u_lat",   0) or 0)
                 lng   = float(v.get("u_long",  0) or 0)
@@ -699,7 +760,12 @@ def main() -> None:
         )
 
     async def post_init(application):
-        # Сбрасываем старые polling-сессии при старте
+        init_db()
+        loaded = db_load_subscriptions()
+        for uid, routes in loaded.items():
+            subscriptions[uid] = routes
+        log.info("Загружено подписок из БД: %d пользователей", len(loaded))
+
         await application.bot.delete_webhook(drop_pending_updates=True)
         await application.bot.set_my_commands([
             BotCommand("track",  "Отслеживать маршрут — /track 212"),
