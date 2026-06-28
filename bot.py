@@ -458,6 +458,12 @@ def nearest_stop_name(lat: float, lng: float, stops: list[dict]) -> Optional[str
     return best["name"]
 
 
+def course_to_str(course: float) -> str:
+    dirs = ["север", "северо-восток", "восток", "юго-восток",
+            "юг", "юго-запад", "запад", "северо-запад"]
+    return dirs[round(course / 45) % 8]
+
+
 # ── Состояние бота ─────────────────────────────────────────────────
 
 # user_id -> set of route_numbers
@@ -465,6 +471,9 @@ subscriptions: dict[int, set[str]] = defaultdict(set)
 
 # route_number -> set of u_id (ТС, которые уже были видны на карте)
 known_vehicles: dict[str, set] = defaultdict(set)
+
+# u_id -> последнее известное состояние ТС (позиция, скорость, курс и т.д.)
+last_seen_vehicles: dict[str, dict] = {}
 
 # route_number -> mr_id (Navitrans internal ID)
 mr_id_cache: dict[str, str] = {}
@@ -779,39 +788,76 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if mr_num in watched:
             by_route[mr_num].append(v)
 
-    # Определяем новые ТС по каждому маршруту один раз — до рассылки,
-    # чтобы все подписчики получили одинаковый список новинок.
-    new_by_route: dict[str, list[dict]] = {}
+    # Обновляем кеш последнего положения всех ТС
+    for v in vehicles:
+        vid = str(v.get("u_id", ""))
+        if vid:
+            last_seen_vehicles[vid] = v
+
+    # Определяем новые и пропавшие ТС по каждому маршруту один раз
+    new_by_route:  dict[str, list[dict]] = {}
+    gone_by_route: dict[str, list[dict]] = {}
     for route in watched:
         current_list = by_route.get(route, [])
         current_ids  = {str(v.get("u_id", "")) for v in current_list if v.get("u_id")}
         prev_ids     = known_vehicles.get(route, set())
         new_ids      = current_ids - prev_ids
+        gone_ids     = prev_ids - current_ids
         known_vehicles[route] = current_ids
-        new_by_route[route] = [v for v in current_list if str(v.get("u_id", "")) in new_ids]
+        new_by_route[route]  = [v for v in current_list if str(v.get("u_id", "")) in new_ids]
+        gone_by_route[route] = [last_seen_vehicles[vid] for vid in gone_ids if vid in last_seen_vehicles]
+
+    def _stop_for(v: dict, route: str) -> str:
+        lat = float(v.get("u_lat", 0) or 0)
+        lng = float(v.get("u_long", 0) or 0)
+        if not lat or not lng:
+            return "нет данных"
+        mr_id = mr_id_cache.get(route)
+        if not mr_id:
+            return "нет данных"
+        if mr_id not in stops_cache:
+            stops_cache[mr_id] = fetch_route_stops(mr_id)
+        stops = stops_cache.get(mr_id, [])
+        return nearest_stop_name(lat, lng, stops) or "нет данных"
 
     for uid, user_routes in list(subscriptions.items()):
         for route in list(user_routes):
+            now = datetime.now().strftime("%H:%M:%S")
+
             for v in new_by_route.get(route, []):
                 plate = str(v.get("u_statenum", "") or "").strip() or "нет данных"
-                lat   = float(v.get("u_lat",   0) or 0)
-                lng   = float(v.get("u_long",  0) or 0)
-                now   = datetime.now().strftime("%H:%M:%S")
-
-                stop_name = "нет данных"
-                mr_id = mr_id_cache.get(route)
-                if mr_id:
-                    if mr_id not in stops_cache:
-                        stops_cache[mr_id] = fetch_route_stops(mr_id)
-                    stops = stops_cache.get(mr_id, [])
-                    if stops and lat and lng:
-                        stop_name = nearest_stop_name(lat, lng, stops) or "нет данных"
-
+                stop_name = _stop_for(v, route)
                 text = (
-                    f"🚌 Маршрут {route} — новое ТС на линии\n"
+                    f"🟢 Маршрут {route} — новое ТС на линии\n"
                     f"🚗 Госномер: {plate}\n"
                     f"🕐 Время: {now}\n"
                     f"📍 Остановка: {stop_name}"
+                )
+                try:
+                    await context.bot.send_message(chat_id=uid, text=text)
+                except Exception as e:
+                    log.warning("send_message uid=%s: %s", uid, e)
+
+            for v in gone_by_route.get(route, []):
+                plate  = str(v.get("u_statenum", "") or "").strip() or "нет данных"
+                speed  = int(float(v.get("u_speed", 0) or 0))
+                course = v.get("u_course")
+                stop_name = _stop_for(v, route)
+
+                direction = ""
+                if course is not None:
+                    try:
+                        direction = f"\n🧭 Направление: {course_to_str(float(course))}"
+                    except Exception:
+                        pass
+
+                text = (
+                    f"🔴 Маршрут {route} — ТС сошло с линии\n"
+                    f"🚗 Госномер: {plate}\n"
+                    f"🕐 Время: {now}\n"
+                    f"📍 Последняя остановка: {stop_name}\n"
+                    f"⚡ Скорость: {speed} км/ч"
+                    f"{direction}"
                 )
                 try:
                     await context.bot.send_message(chat_id=uid, text=text)
