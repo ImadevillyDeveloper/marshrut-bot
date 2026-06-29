@@ -41,6 +41,12 @@ log = logging.getLogger(__name__)
 
 # ── Navitrans / bus-55.ru API ──────────────────────────────────────
 
+ETK55_BALANCE_URL = "https://etk55.ru/local/templates/main/ajax/makeRefillRequest.php"
+ETK55_HEADERS     = {
+    "Referer": "https://etk55.ru/balance/",
+    "Origin":  "https://etk55.ru",
+}
+
 BUS55_BASE    = "https://bus-55.ru/api/rpc.php"
 BUS55_RPC     = "2․2"          # специальная точка (U+2024) — как в оригинале
 BUS55_SYS_ID  = "omsk"
@@ -228,6 +234,25 @@ def fetch_route_stops(mr_id: str) -> list[dict]:
     except Exception as e:
         log.warning("fetch_route_stops mr_id=%s: %s", mr_id, e)
         return []
+
+
+def fetch_card_balance(card_number: str) -> dict:
+    """Запрашивает баланс карты ОМКА через etk55.ru."""
+    try:
+        r = http.post(
+            ETK55_BALANCE_URL,
+            headers=ETK55_HEADERS,
+            data={
+                "balance-card": card_number,
+                "submitType":   "check",
+                "finalStep":    "no",
+            },
+            timeout=10,
+        )
+        return r.json()
+    except Exception as e:
+        log.warning("fetch_card_balance: %s", e)
+        return {}
 
 
 # Полный справочник маршрутов Омска: номер -> описание
@@ -498,12 +523,14 @@ def _menu_text() -> str:
         "🔔 <b>Отслеживание</b> — получай уведомление, когда новое ТС\n"
         "выходит на маршрут (данные ГЛОНАСС, bus-55.ru)\n\n"
         "📍 <b>Где сейчас</b> — смотри геолокацию конкретного автобуса\n\n"
+        "💳 <b>Баланс карты ОМКА</b> — проверь баланс транспортной карты\n\n"
         "<b>Команды:</b>\n"
         "/track <i>номер</i> — начать отслеживать маршрут\n"
         "/where <i>номер</i> — где сейчас ТС маршрута\n"
         "/status — мои подписки\n"
         "/stop <i>номер</i> — снять маршрут\n"
         "/stop — снять все подписки\n"
+        "/card <i>номер карты</i> — баланс карты ОМКА\n"
         "/help — это меню\n\n"
         "💡 Можно просто написать номер маршрута — например: <b>212</b>"
     )
@@ -708,6 +735,70 @@ async def on_route_action(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode=H,
             reply_markup=InlineKeyboardMarkup(buttons),
         )
+
+
+async def cmd_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_html(
+            "💳 Укажи номер карты ОМКА:\n"
+            "/card <i>123456789</i>\n\n"
+            "Номер карты напечатан на обратной стороне карты."
+        )
+        return
+
+    card = " ".join(context.args).strip()
+    if not all(c.isdigit() or c == " " for c in card):
+        await update.message.reply_html(
+            "❌ Номер карты должен содержать только цифры.\n"
+            "Пример: <code>/card 123456789</code>"
+        )
+        return
+
+    msg = await update.message.reply_text("⏳ Запрашиваю баланс...")
+    data = fetch_card_balance(card)
+
+    if not data:
+        await msg.edit_text("❌ Сервер etk55.ru не ответил. Попробуй позже.")
+        return
+
+    if data.get("success"):
+        resp    = data.get("response", {})
+        info    = resp.get("info", {})
+        balance = info.get("balance")
+        tariff_text = (resp.get("tariff") or {}).get("text") or ""
+        warning = resp.get("warningMsg") or ""
+
+        balance_line = f"<b>{balance} ₽</b>" if isinstance(balance, (int, float)) else "нет данных"
+        text = (
+            f"💳 Карта ОМКА: <code>{card}</code>\n\n"
+            f"💰 Баланс: {balance_line}"
+        )
+        if tariff_text:
+            text += f"\n📋 Тариф: {tariff_text}"
+        if warning:
+            text += f"\n⚠️ {warning}"
+        await msg.edit_text(text, parse_mode=H)
+    else:
+        error     = data.get("error", {})
+        error_msg = error.get("errorMsg") or data.get("message") or "Неизвестная ошибка"
+        # Иногда баланс есть даже при ошибке (карта заблокирована и т.п.)
+        inner_balance = (error.get("response") or {}).get("info", {}).get("balance")
+        warning       = (error.get("response") or {}).get("warningMsg") or ""
+
+        if isinstance(inner_balance, (int, float)):
+            text = (
+                f"💳 Карта ОМКА: <code>{card}</code>\n\n"
+                f"💰 Баланс: <b>{inner_balance} ₽</b>\n"
+                f"⚠️ {error_msg}"
+            )
+            if warning:
+                text += f"\n{warning}"
+            await msg.edit_text(text, parse_mode=H)
+        else:
+            await msg.edit_text(
+                f"❌ Не удалось получить баланс.\n\n{error_msg}",
+                parse_mode=H,
+            )
 
 
 # ── Диагностика API ───────────────────────────────────────────────
@@ -1035,6 +1126,7 @@ def main() -> None:
             BotCommand("where",  "Где сейчас ТС маршрута — /where 212"),
             BotCommand("status", "Мои подписки"),
             BotCommand("stop",   "Снять маршрут — /stop 212 или все"),
+            BotCommand("card",   "Баланс карты ОМКА — /card 123456789"),
             BotCommand("help",   "Справка по командам"),
             BotCommand("start",  "Начало работы"),
         ])
@@ -1048,6 +1140,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("stop",   cmd_stop))
     app.add_handler(CommandHandler("where",  cmd_where))
+    app.add_handler(CommandHandler("card",   cmd_card))
     app.add_handler(CommandHandler("debug",  cmd_debug))
     app.add_handler(CallbackQueryHandler(on_route_action,  pattern=r"^route:"))
     app.add_handler(CallbackQueryHandler(on_where_vehicle, pattern=r"^where:"))
