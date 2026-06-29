@@ -737,6 +737,11 @@ async def on_route_action(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
 
 
+_TOPUP_BUTTON = InlineKeyboardMarkup([[
+    InlineKeyboardButton("💳 Пополнить на сайте", url="https://etk55.ru/balance/")
+]])
+
+
 async def cmd_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.message.reply_html(
@@ -758,7 +763,7 @@ async def cmd_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     data = fetch_card_balance(card)
 
     if not data:
-        await msg.edit_text("❌ Сервер etk55.ru не ответил. Попробуй позже.")
+        await msg.edit_text("❌ Сервер etk55.ru не ответил. Попробуй позже.", reply_markup=_TOPUP_BUTTON)
         return
 
     if data.get("success"):
@@ -777,11 +782,10 @@ async def cmd_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             text += f"\n📋 Тариф: {tariff_text}"
         if warning:
             text += f"\n⚠️ {warning}"
-        await msg.edit_text(text, parse_mode=H)
+        await msg.edit_text(text, parse_mode=H, reply_markup=_TOPUP_BUTTON)
     else:
         error     = data.get("error", {})
         error_msg = error.get("errorMsg") or data.get("message") or "Неизвестная ошибка"
-        # Иногда баланс есть даже при ошибке (карта заблокирована и т.п.)
         inner_balance = (error.get("response") or {}).get("info", {}).get("balance")
         warning       = (error.get("response") or {}).get("warningMsg") or ""
 
@@ -793,11 +797,12 @@ async def cmd_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             if warning:
                 text += f"\n{warning}"
-            await msg.edit_text(text, parse_mode=H)
+            await msg.edit_text(text, parse_mode=H, reply_markup=_TOPUP_BUTTON)
         else:
             await msg.edit_text(
                 f"❌ Не удалось получить баланс.\n\n{error_msg}",
                 parse_mode=H,
+                reply_markup=_TOPUP_BUTTON,
             )
 
 
