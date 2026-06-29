@@ -28,6 +28,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    ConversationHandler,
     MessageHandler,
     ContextTypes,
     filters,
@@ -167,6 +168,15 @@ def init_db() -> None:
             PRIMARY KEY (user_id, route)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_cards (
+            user_id     INTEGER NOT NULL,
+            card_number TEXT    NOT NULL,
+            name        TEXT    NOT NULL DEFAULT '',
+            color       TEXT    NOT NULL DEFAULT '💙',
+            PRIMARY KEY (user_id, card_number)
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -234,6 +244,46 @@ def fetch_route_stops(mr_id: str) -> list[dict]:
     except Exception as e:
         log.warning("fetch_route_stops mr_id=%s: %s", mr_id, e)
         return []
+
+
+def db_add_card(uid: int, card_number: str, name: str, color: str) -> None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT OR REPLACE INTO user_cards (user_id, card_number, name, color) VALUES (?, ?, ?, ?)",
+            (uid, card_number, name, color),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning("db_add_card: %s", e)
+
+
+def db_get_cards(uid: int) -> list[dict]:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT card_number, name, color FROM user_cards WHERE user_id = ? ORDER BY rowid",
+            (uid,),
+        ).fetchall()
+        conn.close()
+        return [{"card_number": r[0], "name": r[1], "color": r[2]} for r in rows]
+    except Exception as e:
+        log.warning("db_get_cards: %s", e)
+        return []
+
+
+def db_remove_card(uid: int, card_number: str) -> None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "DELETE FROM user_cards WHERE user_id = ? AND card_number = ?",
+            (uid, card_number),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning("db_remove_card: %s", e)
 
 
 def fetch_card_balance(card_number: str) -> dict:
@@ -513,6 +563,9 @@ stops_cache: dict[str, list] = {}
 
 POLL_INTERVAL = 30  # секунд между проверками
 
+CARD_COLORS = ["❤️", "🧡", "💛", "💚", "💙", "💜", "🩷", "🤍", "🖤", "🤎"]
+ADDCARD_NUMBER, ADDCARD_NAME, ADDCARD_COLOR = range(10, 13)
+
 
 H = "HTML"  # parse_mode shortcut
 
@@ -523,17 +576,34 @@ def _menu_text() -> str:
         "🔔 <b>Отслеживание</b> — получай уведомление, когда новое ТС\n"
         "выходит на маршрут (данные ГЛОНАСС, bus-55.ru)\n\n"
         "📍 <b>Где сейчас</b> — смотри геолокацию конкретного автобуса\n\n"
-        "💳 <b>Баланс карты ОМКА</b> — проверь баланс транспортной карты\n\n"
+        "💳 <b>Мои карты ОМКА</b> — сохрани свои карты и проверяй баланс\n\n"
         "<b>Команды:</b>\n"
         "/track <i>номер</i> — начать отслеживать маршрут\n"
         "/where <i>номер</i> — где сейчас ТС маршрута\n"
         "/status — мои подписки\n"
         "/stop <i>номер</i> — снять маршрут\n"
-        "/stop — снять все подписки\n"
-        "/card <i>номер карты</i> — баланс карты ОМКА\n"
+        "/cards — мои карты ОМКА\n"
+        "/addcard — добавить карту\n"
+        "/card <i>номер</i> — разовая проверка баланса\n"
         "/help — это меню\n\n"
         "💡 Можно просто написать номер маршрута — например: <b>212</b>"
     )
+
+
+def _cards_text_and_markup(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    cards = db_get_cards(uid)
+    add_btn = InlineKeyboardButton("➕ Добавить карту", callback_data="card:addnew")
+    if not cards:
+        return (
+            "💳 У тебя пока нет сохранённых карт.\n\nДобавь первую!",
+            InlineKeyboardMarkup([[add_btn]]),
+        )
+    buttons = [
+        [InlineKeyboardButton(f"{c['color']} {c['name']}", callback_data=f"card:check:{c['card_number']}")]
+        for c in cards
+    ]
+    buttons.append([add_btn])
+    return f"💳 <b>Мои карты ({len(cards)}):</b>\n\nНажми на карту, чтобы узнать баланс.", InlineKeyboardMarkup(buttons)
 
 
 # ── Команды ────────────────────────────────────────────────────────
@@ -740,6 +810,152 @@ async def on_route_action(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 _TOPUP_BUTTON = InlineKeyboardMarkup([[
     InlineKeyboardButton("💳 Пополнить на сайте", url="https://etk55.ru/balance/")
 ]])
+
+
+# ── Список карт и управление ───────────────────────────────────────
+
+async def cmd_cards(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    text, markup = _cards_text_and_markup(uid)
+    await update.message.reply_html(text, reply_markup=markup)
+
+
+async def cmd_addcard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = "Введи номер карты ОМКА (только цифры):"
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text)
+    else:
+        await update.message.reply_text(text)
+    return ADDCARD_NUMBER
+
+
+async def addcard_got_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    card = update.message.text.strip()
+    if not card or not all(c.isdigit() or c == " " for c in card) or not any(c.isdigit() for c in card):
+        await update.message.reply_text("❌ Только цифры. Попробуй ещё раз:")
+        return ADDCARD_NUMBER
+    context.user_data["new_card_number"] = card
+    await update.message.reply_text("Дай название этой карте (например: «Основная», «Рабочая»):")
+    return ADDCARD_NAME
+
+
+async def addcard_got_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()[:30]
+    if not name:
+        await update.message.reply_text("Название не может быть пустым. Попробуй ещё раз:")
+        return ADDCARD_NAME
+    context.user_data["new_card_name"] = name
+    rows = [CARD_COLORS[:5], CARD_COLORS[5:]]
+    buttons = [[InlineKeyboardButton(c, callback_data=f"cardcolor:{c}") for c in row] for row in rows]
+    await update.message.reply_text("Выбери цвет:", reply_markup=InlineKeyboardMarkup(buttons))
+    return ADDCARD_COLOR
+
+
+async def addcard_got_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    color = query.data.split(":", 1)[1]
+    uid = query.from_user.id
+    card_number = context.user_data.pop("new_card_number", "")
+    name = context.user_data.pop("new_card_name", "Карта")
+    db_add_card(uid, card_number, name, color)
+    text, markup = _cards_text_and_markup(uid)
+    await query.edit_message_text(
+        f"✅ Карта добавлена: {color} <b>{name}</b>\n\n" + text,
+        parse_mode=H,
+        reply_markup=markup,
+    )
+    return ConversationHandler.END
+
+
+async def addcard_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("new_card_number", None)
+    context.user_data.pop("new_card_name", None)
+    await update.message.reply_text("Добавление карты отменено.")
+    return ConversationHandler.END
+
+
+async def on_card_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split(":", 2)
+    action = parts[1]
+    uid = query.from_user.id
+
+    if action == "addnew":
+        await query.answer("Отправь /addcard чтобы добавить карту")
+        return
+
+    if action == "list":
+        text, markup = _cards_text_and_markup(uid)
+        await query.edit_message_text(text, parse_mode=H, reply_markup=markup)
+        return
+
+    card_number = parts[2] if len(parts) > 2 else ""
+    cards = db_get_cards(uid)
+    card = next((c for c in cards if c["card_number"] == card_number), None)
+    name  = card["name"]  if card else "Карта"
+    color = card["color"] if card else "💳"
+
+    if action == "check":
+        await query.edit_message_text("⏳ Проверяю баланс...")
+        data = fetch_card_balance(card_number)
+
+        back_btn   = InlineKeyboardButton("◀️ Мои карты", callback_data="card:list")
+        delete_btn = InlineKeyboardButton("🗑 Удалить", callback_data=f"card:delete:{card_number}")
+        topup_btn  = InlineKeyboardButton("💳 Пополнить на сайте", url="https://etk55.ru/balance/")
+        markup = InlineKeyboardMarkup([[topup_btn], [delete_btn, back_btn]])
+
+        def _build_text(balance_line: str, extra: str = "") -> str:
+            return (
+                f"{color} <b>{name}</b>\n"
+                f"<code>{card_number}</code>\n\n"
+                f"💰 Баланс: {balance_line}" + extra
+            )
+
+        if not data:
+            await query.edit_message_text(_build_text("нет данных", "\n❌ Сервер не ответил"), parse_mode=H, reply_markup=markup)
+            return
+
+        if data.get("success"):
+            resp    = data.get("response", {})
+            info    = resp.get("info", {})
+            balance = info.get("balance")
+            tariff_text = (resp.get("tariff") or {}).get("text") or ""
+            warning     = resp.get("warningMsg") or ""
+            b_line = f"<b>{balance} ₽</b>" if isinstance(balance, (int, float)) else "нет данных"
+            extra  = (f"\n📋 Тариф: {tariff_text}" if tariff_text else "") + (f"\n⚠️ {warning}" if warning else "")
+            await query.edit_message_text(_build_text(b_line, extra), parse_mode=H, reply_markup=markup)
+        else:
+            error     = data.get("error", {})
+            error_msg = error.get("errorMsg") or data.get("message") or "Неизвестная ошибка"
+            inner_bal = (error.get("response") or {}).get("info", {}).get("balance")
+            warning   = (error.get("response") or {}).get("warningMsg") or ""
+            if isinstance(inner_bal, (int, float)):
+                extra = f"\n⚠️ {error_msg}" + (f"\n{warning}" if warning else "")
+                await query.edit_message_text(_build_text(f"<b>{inner_bal} ₽</b>", extra), parse_mode=H, reply_markup=markup)
+            else:
+                await query.edit_message_text(_build_text(f"❌ {error_msg}"), parse_mode=H, reply_markup=markup)
+
+    elif action == "delete":
+        await query.edit_message_text(
+            f"Удалить карту {color} <b>{name}</b>?\n<code>{card_number}</code>",
+            parse_mode=H,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Да, удалить", callback_data=f"card:confirmdelete:{card_number}"),
+                InlineKeyboardButton("❌ Отмена", callback_data="card:list"),
+            ]]),
+        )
+
+    elif action == "confirmdelete":
+        db_remove_card(uid, card_number)
+        text, markup = _cards_text_and_markup(uid)
+        await query.edit_message_text(
+            f"🗑 Карта {color} <b>{name}</b> удалена.\n\n" + text,
+            parse_mode=H,
+            reply_markup=markup,
+        )
 
 
 async def cmd_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1127,13 +1343,15 @@ def main() -> None:
 
         await application.bot.delete_webhook(drop_pending_updates=True)
         await application.bot.set_my_commands([
-            BotCommand("track",  "Отслеживать маршрут — /track 212"),
-            BotCommand("where",  "Где сейчас ТС маршрута — /where 212"),
-            BotCommand("status", "Мои подписки"),
-            BotCommand("stop",   "Снять маршрут — /stop 212 или все"),
-            BotCommand("card",   "Баланс карты ОМКА — /card 123456789"),
-            BotCommand("help",   "Справка по командам"),
-            BotCommand("start",  "Начало работы"),
+            BotCommand("track",   "Отслеживать маршрут — /track 212"),
+            BotCommand("where",   "Где сейчас ТС маршрута — /where 212"),
+            BotCommand("status",  "Мои подписки"),
+            BotCommand("stop",    "Снять маршрут — /stop 212 или все"),
+            BotCommand("cards",   "Мои карты ОМКА"),
+            BotCommand("addcard", "Добавить карту ОМКА"),
+            BotCommand("card",    "Разовая проверка баланса — /card 123456789"),
+            BotCommand("help",    "Справка по командам"),
+            BotCommand("start",   "Начало работы"),
         ])
 
     _start_health_server()
@@ -1145,8 +1363,22 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("stop",   cmd_stop))
     app.add_handler(CommandHandler("where",  cmd_where))
+    app.add_handler(CommandHandler("cards",  cmd_cards))
     app.add_handler(CommandHandler("card",   cmd_card))
     app.add_handler(CommandHandler("debug",  cmd_debug))
+    app.add_handler(ConversationHandler(
+        entry_points=[
+            CommandHandler("addcard", cmd_addcard),
+            CallbackQueryHandler(cmd_addcard, pattern=r"^card:addnew$"),
+        ],
+        states={
+            ADDCARD_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, addcard_got_number)],
+            ADDCARD_NAME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, addcard_got_name)],
+            ADDCARD_COLOR:  [CallbackQueryHandler(addcard_got_color, pattern=r"^cardcolor:")],
+        },
+        fallbacks=[CommandHandler("cancel", addcard_cancel)],
+    ))
+    app.add_handler(CallbackQueryHandler(on_card_action,   pattern=r"^card:"))
     app.add_handler(CallbackQueryHandler(on_route_action,  pattern=r"^route:"))
     app.add_handler(CallbackQueryHandler(on_where_vehicle, pattern=r"^where:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
