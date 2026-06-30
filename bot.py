@@ -268,6 +268,29 @@ def fetch_stop_arrivals(st_id: str) -> list[dict]:
         return []
 
 
+def fetch_stop_id_by_name(query: str) -> Optional[str]:
+    """Ищет st_id остановки через API getStopsByName (не зависит от кеша)."""
+    try:
+        data = _rpc("getStopsByName", {"str": query})
+        result = data.get("result", [])
+        if not isinstance(result, list):
+            return None
+        for s in result:
+            name = str(s.get("st_title") or s.get("st_name") or "").strip()
+            if _stop_name_matches(query, name):
+                st_id = str(s.get("st_id") or "").strip()
+                if st_id:
+                    return st_id
+        # Если точного матча нет — берём первый результат
+        if result:
+            st_id = str(result[0].get("st_id") or "").strip()
+            return st_id or None
+        return None
+    except Exception as e:
+        log.warning("fetch_stop_id_by_name query=%s: %s", query, e)
+        return None
+
+
 def _get_stop_id(stop_name: str) -> Optional[str]:
     """Ищет st_id остановки по имени в stops_cache."""
     for stops in stops_cache.values():
@@ -1937,21 +1960,27 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
             if from_lat:
                 break
 
-    # Прогноз прибытия через API — только 1 HTTP-запрос.
-    # getStopArrive возвращает только ТС, которые ещё не проехали остановку.
-    st_id = _get_stop_id(from_stop)
-    arrivals: list[dict] = fetch_stop_arrivals(st_id) if st_id else []
+    # Прогноз прибытия через API.
+    # Сначала ищем st_id в кеше; если нет — запрашиваем через getStopsByName.
+    st_id = _get_stop_id(from_stop) or await asyncio.to_thread(fetch_stop_id_by_name, from_stop)
+    arrivals: list[dict] = await asyncio.to_thread(fetch_stop_arrivals, st_id) if st_id else []
 
-    # Грузим стоп-листы только для маршрутов из прогноза (5–10 запросов, не 25).
-    # Это гарантирует что нужные маршруты попадут в stops_cache и races_cache.
+    # Собираем mr_id маршрутов из прогноза, которых ещё нет в кеше
     forecast_mnums = {str(a.get("mr_num", "")).strip().upper() for a in arrivals}
+    to_load: list[str] = []
     for _v in vehicles:
         _rn  = str(_v.get("mr_num", "")).strip().upper()
         _mid = str(_v.get("mr_id",  "")).strip()
-        if _rn not in forecast_mnums or not _mid:
+        if _rn not in forecast_mnums or not _mid or _mid in stops_cache:
             continue
-        if _mid not in stops_cache:
-            stops_cache[_mid] = fetch_route_stops(_mid)
+        if _mid not in to_load:
+            to_load.append(_mid)
+
+    # Загружаем стопы параллельно — все сразу, не последовательно
+    if to_load:
+        loaded = await asyncio.gather(*[asyncio.to_thread(fetch_route_stops, mid) for mid in to_load])
+        for mid, stops in zip(to_load, loaded):
+            stops_cache[mid] = stops
 
     routes = _find_routes_connecting(from_stop, to_stop)
     if not routes:
