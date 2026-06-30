@@ -2694,15 +2694,7 @@ def main() -> None:
 
         await application.bot.delete_webhook(drop_pending_updates=True)
         await application.bot.set_my_commands([
-            BotCommand("track",   "Отслеживать маршрут — /track 212"),
-            BotCommand("where",   "Где сейчас ТС маршрута — /where 212"),
-            BotCommand("status",  "Мои подписки"),
-            BotCommand("stop",    "Снять маршрут — /stop 212 или все"),
-            BotCommand("cards",   "Мои карты ОМКА"),
-            BotCommand("addcard", "Добавить карту ОМКА"),
-            BotCommand("card",    "Разовая проверка баланса — /card 123456789"),
-            BotCommand("help",    "Справка по командам"),
-            BotCommand("start",   "Начало работы"),
+            BotCommand("start", "Открыть главное меню"),
         ])
 
     _start_health_server()
