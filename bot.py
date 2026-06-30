@@ -202,6 +202,11 @@ def init_db() -> None:
             first_seen TEXT    NOT NULL DEFAULT (datetime('now'))
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sent_broadcasts (
+            broadcast_id TEXT PRIMARY KEY
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -2688,6 +2693,57 @@ async def _warmup_stops_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("Warmup: готово, индекс остановок: %d остановок", len(all_stops_index))
 
 
+async def _broadcast_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    BROADCAST_ID = "demo_v1"
+    conn = sqlite3.connect(DB_PATH)
+    already_sent = conn.execute(
+        "SELECT 1 FROM sent_broadcasts WHERE broadcast_id = ?", (BROADCAST_ID,)
+    ).fetchone()
+    if already_sent:
+        conn.close()
+        return
+
+    rows = conn.execute("""
+        SELECT user_id FROM users
+        UNION
+        SELECT user_id FROM subscriptions
+        UNION
+        SELECT user_id FROM user_cards
+    """).fetchall()
+    conn.close()
+
+    user_ids = [r[0] for r in rows]
+    if not user_ids:
+        return
+
+    text = (
+        "🚌 <b>В боте появился новый функционал — «Мой маршрут»!</b>\n\n"
+        "Теперь вы можете указать начальную и конечную остановку, "
+        "и бот подберёт автобусы, которые едут именно по вашему маршруту — "
+        "с временем прибытия и номером ТС.\n\n"
+        "Это стабильная демо-версия. Попробовать можно через кнопку "
+        "<b>МОЙ МАРШРУТ</b> в главном меню.\n\n"
+        "⚠️ Рекомендуем тестировать не раньше завтрашнего утра — "
+        "тогда на линии будет наибольшее количество транспортных средств "
+        "и функция отработает в полную силу.\n\n"
+        "Есть предложения по улучшению? Пишите: @sprint_err"
+    )
+
+    ok = fail = 0
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(chat_id=uid, text=text, parse_mode=H)
+            ok += 1
+        except Exception:
+            fail += 1
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT OR IGNORE INTO sent_broadcasts (broadcast_id) VALUES (?)", (BROADCAST_ID,))
+    conn.commit()
+    conn.close()
+    log.info("Рассылка demo_v1: отправлено %d, ошибок %d", ok, fail)
+
+
 # ── Запуск ─────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -2752,6 +2808,7 @@ def main() -> None:
 
     app.job_queue.run_repeating(poll_job, interval=POLL_INTERVAL, first=15)
     app.job_queue.run_once(_warmup_stops_job, when=10)
+    app.job_queue.run_once(_broadcast_job, when=20)
 
     log.info("Бот запущен. Интервал опроса: %d сек.", POLL_INTERVAL)
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
