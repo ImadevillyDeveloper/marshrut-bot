@@ -1830,15 +1830,23 @@ def _direction_is_correct(mr_id: str, arr_dir: str, from_stop: str, to_stop: str
     return False
 
 
-def _find_routes_connecting(from_stop: str, to_stop: str) -> list[tuple]:
+def _find_routes_connecting(
+    from_stop: str,
+    to_stop: str,
+    allowed_mr_ids: Optional[set] = None,
+) -> list[tuple]:
     """
     Возвращает [(route_num, mr_id, terminal), ...] — маршруты, по которым можно
     доехать от from_stop до to_stop напрямую (to_stop стоит после from_stop в рейсе).
+    allowed_mr_ids — если задано, проверяются только маршруты из этого множества
+    (используется чтобы не выдавать маршруты из старого кеша, не связанного с запросом).
     """
     route_by_mr = {v: k for k, v in mr_id_cache.items()}
     results: list[tuple] = []
     seen_routes: set[str] = set()
     for mr_id, stops in stops_cache.items():
+        if allowed_mr_ids is not None and mr_id not in allowed_mr_ids:
+            continue
         route_num = route_by_mr.get(mr_id)
         if not route_num or route_num in seen_routes:
             continue
@@ -1966,12 +1974,14 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
     # Собираем mr_id маршрутов из прогноза, которых ещё нет в кеше
     forecast_mnums = {str(a.get("mr_num", "")).strip().upper() for a in arrivals}
     to_load: list[str] = []
+    forecast_mr_ids: set[str] = set()  # mr_id только тех маршрутов, что в прогнозе
     for _v in vehicles:
         _rn  = str(_v.get("mr_num", "")).strip().upper()
         _mid = str(_v.get("mr_id",  "")).strip()
-        if _rn not in forecast_mnums or not _mid or _mid in stops_cache:
+        if _rn not in forecast_mnums or not _mid:
             continue
-        if _mid not in to_load:
+        forecast_mr_ids.add(_mid)
+        if _mid not in stops_cache and _mid not in to_load:
             to_load.append(_mid)
 
     # Загружаем стопы параллельно — все сразу, не последовательно
@@ -1980,7 +1990,9 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
         for mid, stops in zip(to_load, loaded):
             stops_cache[mid] = stops
 
-    routes = _find_routes_connecting(from_stop, to_stop)
+    # Ищем только среди маршрутов из прогноза, а не по всему stops_cache
+    # (иначе старые записи кеша дают ложные совпадения с чужими маршрутами)
+    routes = _find_routes_connecting(from_stop, to_stop, forecast_mr_ids or None)
     if not routes:
         await edit_fn(
             f"Не нашли прямых маршрутов из «{from_stop}» до «{to_stop}».\n\n"
