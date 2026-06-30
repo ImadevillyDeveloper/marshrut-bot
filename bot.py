@@ -229,7 +229,7 @@ def db_remove_all_subs(uid: int) -> None:
 
 
 def fetch_route_stops(mr_id: str) -> list[dict]:
-    """Список остановок маршрута с именами: [{name, lat, lng}, ...]. Также кеширует рейсы."""
+    """Список остановок маршрута: [{name, lat, lng, st_id}, ...]. Также кеширует рейсы."""
     try:
         data = _rpc("getRoute", {"mr_id": mr_id})
         races = data.get("result", {}).get("races", [])
@@ -242,12 +242,43 @@ def fetch_route_stops(mr_id: str) -> list[dict]:
                 lng  = s.get("st_long")
                 name = (s.get("st_title") or s.get("st_name") or "").strip()
                 if lat and lng and name and name not in seen:
-                    stops.append({"name": name, "lat": float(lat), "lng": float(lng)})
+                    stops.append({
+                        "name":  name,
+                        "lat":   float(lat),
+                        "lng":   float(lng),
+                        "st_id": str(s.get("st_id") or ""),
+                    })
                     seen.add(name)
         return stops
     except Exception as e:
         log.warning("fetch_route_stops mr_id=%s: %s", mr_id, e)
         return []
+
+
+def fetch_stop_arrivals(st_id: str) -> list[dict]:
+    """Прогноз прибытия на остановку: [{mr_num, tc_arrivetime, laststation_title}, ...]."""
+    try:
+        data = _rpc("getStopArrive", {"st_id": st_id})
+        result = data.get("result")
+        if isinstance(result, list):
+            return result
+        return []
+    except Exception as e:
+        log.warning("fetch_stop_arrivals st_id=%s: %s", st_id, e)
+        return []
+
+
+def _get_stop_id(stop_name: str) -> Optional[str]:
+    """Ищет st_id остановки по имени в stops_cache."""
+    q = stop_name.lower()
+    for stops in stops_cache.values():
+        for s in stops:
+            n = s["name"].lower()
+            if q in n or n in q:
+                st_id = s.get("st_id")
+                if st_id:
+                    return st_id
+    return None
 
 
 def db_add_card(uid: int, card_number: str, name: str, color: str) -> None:
@@ -1751,11 +1782,11 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
     new_dest_btn = InlineKeyboardButton("✏️ Другая конечная",       callback_data="findbus:askdest")
 
     vehicles = fetch_vehicles()
-    # Всегда подгружаем остановки активных маршрутов в кеш,
-    # чтобы не пропустить маршруты, которые ещё не запрашивались
+    # Подгружаем остановки активных маршрутов в кеш чтобы иметь st_id и маршруты
     _fetch_active_stops(vehicles)
-    routes   = _find_routes_connecting(from_stop, to_stop)
 
+    # Определяем какие маршруты везут from_stop → to_stop и их конечные
+    routes = _find_routes_connecting(from_stop, to_stop)
     if not routes:
         await edit_fn(
             f"Не нашли прямых маршрутов из «{from_stop}» до «{to_stop}».\n\n"
@@ -1764,73 +1795,112 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
         )
         return
 
-    # Координаты начальной остановки для сортировки ТС
-    from_lat = context.user_data.get("findbus_from_lat")
-    from_lng = context.user_data.get("findbus_from_lng")
-    if not from_lat:
-        for stops in stops_cache.values():
-            for s in stops:
-                if from_stop.lower() in s["name"].lower() or s["name"].lower() in from_stop.lower():
-                    from_lat, from_lng = s["lat"], s["lng"]
-                    break
-            if from_lat:
-                break
+    # Прогноз прибытия на начальную остановку через API (то же что и окошко на сайте)
+    st_id = _get_stop_id(from_stop)
+    arrivals: list[dict] = fetch_stop_arrivals(st_id) if st_id else []
 
-    # Собираем подходящие ТС: правильное направление + ещё не доехали до начальной остановки
+    # Строим карту (route_num, terminal) → u_id из списка активных ТС (для кнопки детали)
+    # Ключ — нормализованное название конечной
+    uid_map: dict[tuple, str] = {}
+    for v in vehicles:
+        r_num = str(v.get("mr_num", "")).strip().upper()
+        term  = str(v.get("rl_laststation_title", "") or "").strip()
+        u_id  = str(v.get("u_id", ""))
+        if r_num and term and u_id:
+            uid_map[(r_num, term)] = u_id
+
+    # Допустимые конечные по каждому маршруту (из _find_routes_connecting)
+    route_terminals: dict[str, str] = {rn: term for rn, _, term in routes}
+
+    # Фильтруем прибытия: только маршруты, едущие в сторону to_stop
     all_entries: list[dict] = []
-    for route_num, mr_id, terminal in routes:
-        route_stops = stops_cache.get(mr_id, [])
-        for v in vehicles:
-            if str(v.get("mr_num", "")).strip().upper() != route_num:
-                continue
-            if not v.get("u_lat") or not v.get("u_long"):
-                continue
-            v_terminal = str(v.get("rl_laststation_title", "") or "").strip()
-            if not (v_terminal == terminal
-                    or terminal.lower() in v_terminal.lower()
-                    or v_terminal.lower() in terminal.lower()):
-                continue
-            vlat = float(v["u_lat"])
-            vlng = float(v["u_long"])
-            if not _vehicle_is_before_stop(mr_id, terminal, vlat, vlng, from_stop):
-                continue
-            dist_m   = haversine_m(from_lat, from_lng, vlat, vlng) if (from_lat and from_lng) else float("inf")
-            near_stp = nearest_stop_name(vlat, vlng, route_stops) or "нет данных"
-            all_entries.append({
-                "route_num": route_num,
-                "terminal":  terminal,
-                "uid_v":     str(v.get("u_id", "")),
-                "plate":     str(v.get("u_statenum", "") or "").strip() or "б/н",
-                "speed":     int(float(v.get("u_speed", 0) or 0)),
-                "near_stp":  near_stp,
-                "dist_m":    dist_m,
-            })
+    seen_arrivals: set[tuple] = set()
+    for arr in arrivals:
+        mr_num   = str(arr.get("mr_num", "")).strip().upper()
+        arr_time = str(arr.get("tc_arrivetime", "")).strip()
+        arr_dir  = str(arr.get("laststation_title", "")).strip()
+
+        if mr_num not in route_terminals:
+            continue
+        terminal = route_terminals[mr_num]
+        # Проверяем что направление совпадает с нужной конечной
+        if not (arr_dir == terminal
+                or terminal.lower() in arr_dir.lower()
+                or arr_dir.lower() in terminal.lower()):
+            continue
+
+        key = (mr_num, arr_time, arr_dir)
+        if key in seen_arrivals:
+            continue
+        seen_arrivals.add(key)
+
+        # Ищем u_id для этого ТС чтобы можно было нажать и посмотреть детали
+        uid_v = uid_map.get((mr_num, arr_dir), "")
+
+        all_entries.append({
+            "route_num": mr_num,
+            "arr_time":  arr_time,
+            "terminal":  arr_dir,
+            "uid_v":     uid_v,
+        })
+
+    if not all_entries:
+        # Прогноза нет (нерабочее время или st_id не найден) — откат к старому методу по ТС
+        all_entries_fallback: list[dict] = []
+        for route_num, mr_id, terminal in routes:
+            route_stops = stops_cache.get(mr_id, [])
+            for v in vehicles:
+                if str(v.get("mr_num", "")).strip().upper() != route_num:
+                    continue
+                if not v.get("u_lat") or not v.get("u_long"):
+                    continue
+                v_terminal = str(v.get("rl_laststation_title", "") or "").strip()
+                if not (v_terminal == terminal
+                        or terminal.lower() in v_terminal.lower()
+                        or v_terminal.lower() in terminal.lower()):
+                    continue
+                vlat = float(v["u_lat"])
+                vlng = float(v["u_long"])
+                if not _vehicle_is_before_stop(mr_id, terminal, vlat, vlng, from_stop):
+                    continue
+                from_lat = context.user_data.get("findbus_from_lat")
+                from_lng = context.user_data.get("findbus_from_lng")
+                dist_m   = haversine_m(from_lat, from_lng, vlat, vlng) if (from_lat and from_lng) else float("inf")
+                near_stp = nearest_stop_name(vlat, vlng, route_stops) or "нет данных"
+                all_entries_fallback.append({
+                    "route_num": route_num,
+                    "arr_time":  None,
+                    "terminal":  terminal,
+                    "uid_v":     str(v.get("u_id", "")),
+                    "near_stp":  near_stp,
+                    "dist_m":    dist_m,
+                })
+        all_entries_fallback.sort(key=lambda x: x["dist_m"])
+        all_entries = all_entries_fallback[:5]
 
     if not all_entries:
         await edit_fn(
-            f"Нет подходящих ТС — все автобусы в направлении «{to_stop}» уже проехали «{from_stop}».",
+            f"Сейчас нет транспорта, следующего из «{from_stop}» до «{to_stop}».",
             reply_markup=InlineKeyboardMarkup([[retry_btn], [new_dest_btn], [home_btn]]),
         )
         return
 
-    all_entries.sort(key=lambda x: x["dist_m"])
-
     vehicle_btns: list[list[InlineKeyboardButton]] = []
     for e in all_entries[:5]:
-        dist_str = (
-            f"{int(e['dist_m'])} м" if e["dist_m"] < 1000 else f"{e['dist_m'] / 1000:.1f} км"
-        ) if e["dist_m"] != float("inf") else ""
-        dist_part = f" · {dist_str}" if dist_str else ""
-        label = f"🚌 {e['route_num']}  🚗 {e['plate']}  ⚡{e['speed']} км/ч  📍 {e['near_stp']}{dist_part}"
-        vehicle_btns.append([
-            InlineKeyboardButton(label, callback_data=f"where:{e['uid_v']}:{e['route_num']}")
-        ])
+        if e.get("arr_time"):
+            label = f"🚌 {e['route_num']} → {e['terminal']}  ⏱ {e['arr_time']}"
+        else:
+            dist = e.get("dist_m", float("inf"))
+            dist_str = f"{int(dist)} м" if dist < 1000 else f"{dist / 1000:.1f} км"
+            label = f"🚌 {e['route_num']} → {e['terminal']}  📍 {e.get('near_stp', '')} ({dist_str})"
+        cb = f"where:{e['uid_v']}:{e['route_num']}" if e["uid_v"] else "findbus:refresh"
+        vehicle_btns.append([InlineKeyboardButton(label, callback_data=cb)])
 
     vehicle_btns.append([retry_btn, new_dest_btn])
     vehicle_btns.append([home_btn])
 
     await edit_fn(
-        f"🚏 <b>{from_stop}</b> → <b>{to_stop}</b>\n\nАвтобусы, которые ещё не доехали до вас:",
+        f"🚏 <b>{from_stop}</b> → <b>{to_stop}</b>\n\nПрибытие на вашу остановку:",
         parse_mode=H,
         reply_markup=InlineKeyboardMarkup(vehicle_btns),
     )
