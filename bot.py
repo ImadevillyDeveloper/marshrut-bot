@@ -570,23 +570,23 @@ ADDCARD_NUMBER, ADDCARD_NAME, ADDCARD_COLOR = range(10, 13)
 H = "HTML"  # parse_mode shortcut
 
 
-def _menu_text() -> str:
+def _main_menu_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔔 Мои подписки", callback_data="menu:status"),
+            InlineKeyboardButton("💳 Мои карты",    callback_data="menu:cards"),
+        ],
+        [InlineKeyboardButton("❓ Справка", callback_data="menu:help")],
+    ])
+
+
+def _main_menu_text(name: str = "") -> str:
+    greeting = f"👋 <b>{name}!</b>\n\n" if name else ""
     return (
-        "Что умею:\n\n"
-        "🔔 <b>Отслеживание</b> — получай уведомление, когда новое ТС\n"
-        "выходит на маршрут (данные ГЛОНАСС, bus-55.ru)\n\n"
-        "📍 <b>Где сейчас</b> — смотри геолокацию конкретного автобуса\n\n"
-        "💳 <b>Мои карты ОМКА</b> — сохрани свои карты и проверяй баланс\n\n"
-        "<b>Команды:</b>\n"
-        "/track <i>номер</i> — начать отслеживать маршрут\n"
-        "/where <i>номер</i> — где сейчас ТС маршрута\n"
-        "/status — мои подписки\n"
-        "/stop <i>номер</i> — снять маршрут\n"
-        "/cards — мои карты ОМКА\n"
-        "/addcard — добавить карту\n"
-        "/card <i>номер</i> — разовая проверка баланса\n"
-        "/help — это меню\n\n"
-        "💡 Можно просто написать номер маршрута — например: <b>212</b>"
+        greeting
+        + "Я слежу за автобусами Омска в реальном времени.\n\n"
+        "💡 Напиши номер маршрута — например <b>24</b> или <b>212</b> — "
+        "и выбери что сделать."
     )
 
 
@@ -609,16 +609,18 @@ def _cards_text_and_markup(uid: int) -> tuple[str, InlineKeyboardMarkup]:
 # ── Команды ────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    name = update.effective_user.first_name or "Привет"
+    name = update.effective_user.first_name or ""
     await update.message.reply_html(
-        f"👋 <b>{name}!</b>\n\n"
-        f"Я бот мониторинга автобусов Омска.\n\n"
-        + _menu_text()
+        _main_menu_text(name),
+        reply_markup=_main_menu_markup(),
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_html(_menu_text())
+    await update.message.reply_html(
+        _main_menu_text(),
+        reply_markup=_main_menu_markup(),
+    )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -880,6 +882,70 @@ async def on_route_action(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode=H,
             reply_markup=_route_menu_markup(route, uid),
         )
+
+
+_BACK_TO_MENU = [[InlineKeyboardButton("◀️ Главное меню", callback_data="menu:back")]]
+
+
+async def on_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, action = query.data.split(":", 1)
+    uid = query.from_user.id
+
+    if action == "back":
+        name = query.from_user.first_name or ""
+        await query.edit_message_text(
+            _main_menu_text(name), parse_mode=H, reply_markup=_main_menu_markup()
+        )
+
+    elif action == "help":
+        await query.edit_message_text(
+            "<b>Маршруты</b>\n"
+            "Напиши номер маршрута в чат (например <b>212</b>) и выбери что сделать.\n\n"
+            "/track <i>номер</i> — начать отслеживать\n"
+            "/where <i>номер</i> — где ТС прямо сейчас\n"
+            "/status — мои подписки\n"
+            "/stop <i>номер</i> — снять маршрут\n\n"
+            "<b>Карты ОМКА</b>\n"
+            "/cards — мои карты\n"
+            "/addcard — добавить карту\n"
+            "/card <i>номер</i> — разовая проверка баланса",
+            parse_mode=H,
+            reply_markup=InlineKeyboardMarkup(_BACK_TO_MENU),
+        )
+
+    elif action == "status":
+        routes = subscriptions.get(uid, set())
+        if not routes:
+            text = "У тебя нет активных подписок.\n\n💡 Напиши номер маршрута чтобы начать отслеживать."
+            markup = InlineKeyboardMarkup(_BACK_TO_MENU)
+        else:
+            lines = []
+            for r in sorted(routes, key=lambda x: (len(x), x)):
+                known = len(known_vehicles.get(r, set()))
+                desc  = OMSK_ROUTES.get(r, "")
+                lines.append(f"🚌 <b>{r}</b> — {desc}\n     На линии: <b>{known} ТС</b>")
+            text   = f"🔔 <b>Отслеживаемые маршруты ({len(routes)}):</b>\n\n" + "\n\n".join(lines)
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛑 Снять все подписки", callback_data="menu:stopall")],
+                *_BACK_TO_MENU,
+            ])
+        await query.edit_message_text(text, parse_mode=H, reply_markup=markup)
+
+    elif action == "stopall":
+        subscriptions.pop(uid, None)
+        db_remove_all_subs(uid)
+        await query.edit_message_text(
+            "🛑 Все подписки сняты.",
+            parse_mode=H,
+            reply_markup=InlineKeyboardMarkup(_BACK_TO_MENU),
+        )
+
+    elif action == "cards":
+        text, base_markup = _cards_text_and_markup(uid)
+        buttons = list(base_markup.inline_keyboard) + _BACK_TO_MENU
+        await query.edit_message_text(text, parse_mode=H, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 _TOPUP_BUTTON = InlineKeyboardMarkup([[
@@ -1492,6 +1558,7 @@ def main() -> None:
         },
         fallbacks=[CommandHandler("cancel", addcard_cancel)],
     ))
+    app.add_handler(CallbackQueryHandler(on_menu_action,    pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(on_card_action,    pattern=r"^card:"))
     app.add_handler(CallbackQueryHandler(on_route_action,  pattern=r"^route:"))
     app.add_handler(CallbackQueryHandler(on_filter_action, pattern=r"^filter:"))
