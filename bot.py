@@ -1839,11 +1839,23 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
 
     from_lat = context.user_data.get("findbus_from_lat")
     from_lng = context.user_data.get("findbus_from_lng")
+    # При ручном вводе геокоординаты не сохранены — ищем в кеше остановок
+    if not from_lat:
+        for _stops in stops_cache.values():
+            for _s in _stops:
+                if from_stop.lower() in _s["name"].lower() or _s["name"].lower() in from_stop.lower():
+                    from_lat, from_lng = _s["lat"], _s["lng"]
+                    break
+            if from_lat:
+                break
 
     # Прогноз прибытия на начальную остановку через API (тот же источник что окошко на сайте).
     # getStopArrive возвращает только ТС, которые ещё не проехали остановку — условие "не доехал" выполнено.
     st_id = _get_stop_id(from_stop)
     arrivals: list[dict] = fetch_stop_arrivals(st_id) if st_id else []
+
+    # mr_id для маршрутов, которые прошли проверку _find_routes_connecting — самый надёжный источник
+    mr_id_by_route: dict[str, str] = {rn: mid for rn, mid, _ in routes}
 
     # Список ТС по маршруту, отсортированный по расстоянию до from_stop.
     # Используется чтобы сопоставить прибытие из прогноза с конкретным ТС (для near_stp и u_id).
@@ -1855,7 +1867,8 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
             continue
         vlat = float(v["u_lat"])
         vlng = float(v["u_long"])
-        mr_id = mr_id_cache.get(r_num, "")
+        # Предпочитаем mr_id из routes (прошёл проверку), иначе из общего кеша
+        mr_id = mr_id_by_route.get(r_num) or mr_id_cache.get(r_num, "")
         route_stops = stops_cache.get(mr_id, []) if mr_id else []
         near_stp = nearest_stop_name(vlat, vlng, route_stops) or ""
         dist = haversine_m(from_lat, from_lng, vlat, vlng) if (from_lat and from_lng) else float("inf")
@@ -1873,13 +1886,20 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
     all_entries: list[dict] = []
     seen_arrivals: set[tuple] = set()
     assigned_uids: set[str] = set()
+    route_count: dict[str, int] = defaultdict(int)  # не более 2 ТС одного маршрута
 
     for arr in arrivals:
+        if len(all_entries) >= 5:
+            break
+
         mr_num   = str(arr.get("mr_num", "")).strip().upper()
         arr_time = str(arr.get("tc_arrivetime", "")).strip()
         arr_dir  = str(arr.get("laststation_title", "")).strip()
 
-        mr_id = mr_id_cache.get(mr_num)
+        if route_count[mr_num] >= 2:
+            continue
+
+        mr_id = mr_id_by_route.get(mr_num) or mr_id_cache.get(mr_num)
         if not mr_id:
             continue
         if not _direction_is_correct(mr_id, arr_dir, from_stop, to_stop):
@@ -1903,6 +1923,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
                 assigned_uids.add(uid_v)
                 break
 
+        route_count[mr_num] += 1
         all_entries.append({
             "route_num": mr_num,
             "arr_time":  arr_time,
