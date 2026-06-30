@@ -194,6 +194,14 @@ def init_db() -> None:
             route_num TEXT NOT NULL DEFAULT ''
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id    INTEGER PRIMARY KEY,
+            first_name TEXT    NOT NULL DEFAULT '',
+            username   TEXT    NOT NULL DEFAULT '',
+            first_seen TEXT    NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -821,7 +829,18 @@ def _cards_text_and_markup(uid: int) -> tuple[str, InlineKeyboardMarkup]:
 # ── Команды ────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    name = update.effective_user.first_name or ""
+    user = update.effective_user
+    name = user.first_name or ""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT OR IGNORE INTO users (user_id, first_name, username) VALUES (?, ?, ?)",
+            (user.id, name, user.username or ""),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
     await update.message.reply_html(
         _main_menu_text(name),
         reply_markup=_main_menu_markup(),
