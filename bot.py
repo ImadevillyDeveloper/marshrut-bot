@@ -1994,14 +1994,17 @@ def _find_routes_connecting(
     from_stop: str,
     to_stop: str,
     allowed_mr_ids: Optional[set] = None,
-    from_stop_st_id: Optional[str] = None,
+    from_stop_query: Optional[str] = None,
 ) -> list[tuple]:
     """
     Возвращает [(route_num, mr_id, terminal), ...] — маршруты, по которым можно
     доехать от from_stop до to_stop напрямую (to_stop стоит после from_stop в рейсе).
     allowed_mr_ids — если задано, проверяются только маршруты из этого множества.
-    from_stop_st_id — если задано, проверяет вхождение по st_id (точнее fuzzy имени).
+    from_stop_query — оригинальный короткий запрос пользователя ("мега"), предпочтительнее
+    полного канонического имени для матчинга: исключает ложные совпадения через слова-омонимы
+    (напр. слово "магазин" в названии остановки vs в "Торговый центр МЕГА Магазин...").
     """
+    match_from = from_stop_query or from_stop
     route_by_mr = {v: k for k, v in mr_id_cache.items()}
     results: list[tuple] = []
     seen_routes: set[str] = set()
@@ -2011,10 +2014,7 @@ def _find_routes_connecting(
         route_num = route_by_mr.get(mr_id)
         if not route_num or route_num in seen_routes:
             continue
-        if from_stop_st_id:
-            from_found = any(s.get("st_id") == from_stop_st_id for s in stops)
-        else:
-            from_found = any(_stop_name_matches(from_stop, s["name"]) for s in stops)
+        from_found = any(_stop_name_matches(match_from, s["name"]) for s in stops)
         if not from_found:
             continue
         to_found = any(_stop_name_matches(to_stop, s["name"]) for s in stops)
@@ -2085,9 +2085,10 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     stop_name, _, _, dist_m = result
-    context.user_data["findbus_from_stop"] = stop_name
-    context.user_data["findbus_from_lat"]  = lat
-    context.user_data["findbus_from_lng"]  = lng
+    context.user_data["findbus_from_stop"]  = stop_name
+    context.user_data["findbus_from_lat"]   = lat
+    context.user_data["findbus_from_lng"]   = lng
+    context.user_data["findbus_from_query"] = None  # гео-путь, не текстовый запрос
 
     dist_str = f"{int(dist_m)} м" if dist_m < 1000 else f"{dist_m / 1000:.1f} км"
     await msg.edit_text(
@@ -2158,7 +2159,8 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
 
     # Ищем только среди маршрутов из прогноза, а не по всему stops_cache
     # (иначе старые записи кеша дают ложные совпадения с чужими маршрутами)
-    routes = _find_routes_connecting(from_stop, to_stop, forecast_mr_ids or None, from_stop_st_id=st_id or None)
+    from_stop_query = context.user_data.get("findbus_from_query")
+    routes = _find_routes_connecting(from_stop, to_stop, forecast_mr_ids or None, from_stop_query=from_stop_query)
     log.info("findbus: routes=%s", [(r[0], r[2]) for r in routes])
     if not routes:
         await edit_fn(
@@ -2462,6 +2464,7 @@ async def _handle_findbus_from_text(update: Update, context: ContextTypes.DEFAUL
 
     if len(unique_names) == 1:
         context.user_data["findbus_from_stop"]    = unique_names[0]
+        context.user_data["findbus_from_query"]   = stop_query
         context.user_data["findbus_waiting_dest"] = True
         other_btn = InlineKeyboardButton("✏️ Другая остановка", callback_data="findbus:manual")
         await msg.edit_text(
@@ -2471,7 +2474,8 @@ async def _handle_findbus_from_text(update: Update, context: ContextTypes.DEFAUL
             reply_markup=InlineKeyboardMarkup([[other_btn], [home_btn]]),
         )
     else:
-        context.user_data["findbus_from_opts"] = unique_names[:4]
+        context.user_data["findbus_from_opts"]  = unique_names[:4]
+        context.user_data["findbus_from_query"] = stop_query
         buttons = [
             [InlineKeyboardButton(n, callback_data=f"findbus:from_pick:{i}")]
             for i, n in enumerate(unique_names[:4])
