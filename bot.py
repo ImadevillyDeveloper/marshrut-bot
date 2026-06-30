@@ -1665,6 +1665,42 @@ def _find_routes_connecting(from_stop: str, to_stop: str) -> list[tuple]:
     return sorted(results, key=lambda x: (len(x[0]), x[0]))
 
 
+def _vehicle_is_before_stop(mr_id: str, terminal: str, vlat: float, vlng: float, from_stop: str) -> bool:
+    """
+    Возвращает True если ТС ещё не доехало до from_stop (будет там).
+    Сравнивает индекс ближайшей к ТС остановки с индексом from_stop в рейсе.
+    """
+    races = races_cache.get(mr_id, [])
+    for race in races:
+        raw_stops = race.get("stopList", [])
+        names = [(s.get("st_title") or s.get("st_name") or "").strip() for s in raw_stops]
+        if not names:
+            continue
+        last = names[-1]
+        if not (last == terminal or terminal.lower() in last.lower() or last.lower() in terminal.lower()):
+            continue
+
+        from_i = next(
+            (i for i, n in enumerate(names) if from_stop.lower() in n.lower() or n.lower() in from_stop.lower()),
+            -1,
+        )
+        if from_i == -1:
+            return True
+
+        race_coords = [
+            {"lat": float(s["st_lat"]), "lng": float(s["st_long"])}
+            for s in raw_stops
+            if s.get("st_lat") and s.get("st_long")
+        ]
+        if not race_coords:
+            return True
+
+        nearest_i = min(range(len(race_coords)), key=lambda i: haversine_m(vlat, vlng, race_coords[i]["lat"], race_coords[i]["lng"]))
+        return nearest_i <= from_i
+
+    return True  # рейс не найден — включаем по умолчанию
+
+
 async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Пользователь отправил геолокацию — определяем ближайшую остановку."""
     loc = update.message.location
@@ -1741,7 +1777,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
             if from_lat:
                 break
 
-    # Собираем все подходящие ТС в плоский список
+    # Собираем подходящие ТС: правильное направление + ещё не доехали до начальной остановки
     all_entries: list[dict] = []
     for route_num, mr_id, terminal in routes:
         route_stops = stops_cache.get(mr_id, [])
@@ -1754,39 +1790,47 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
                 continue
             vlat = float(v["u_lat"])
             vlng = float(v["u_long"])
-            dist_m = haversine_m(from_lat, from_lng, vlat, vlng) if (from_lat and from_lng) else float("inf")
+            if not _vehicle_is_before_stop(mr_id, terminal, vlat, vlng, from_stop):
+                continue
+            dist_m   = haversine_m(from_lat, from_lng, vlat, vlng) if (from_lat and from_lng) else float("inf")
+            near_stp = nearest_stop_name(vlat, vlng, route_stops) or "нет данных"
             all_entries.append({
                 "route_num": route_num,
                 "terminal":  terminal,
+                "uid_v":     str(v.get("u_id", "")),
                 "plate":     str(v.get("u_statenum", "") or "").strip() or "б/н",
                 "speed":     int(float(v.get("u_speed", 0) or 0)),
-                "near_stp":  nearest_stop_name(vlat, vlng, route_stops) or "нет данных",
+                "near_stp":  near_stp,
                 "dist_m":    dist_m,
             })
 
     if not all_entries:
         await edit_fn(
-            f"Маршруты есть, но сейчас нет ТС в направлении «{to_stop}».",
+            f"Нет подходящих ТС — все автобусы в направлении «{to_stop}» уже проехали «{from_stop}».",
             reply_markup=InlineKeyboardMarkup([[retry_btn], [new_dest_btn], [home_btn]]),
         )
         return
 
     all_entries.sort(key=lambda x: x["dist_m"])
-    lines: list[str] = []
-    for i, e in enumerate(all_entries[:5], 1):
+
+    vehicle_btns: list[list[InlineKeyboardButton]] = []
+    for e in all_entries[:5]:
         dist_str = (
             f"{int(e['dist_m'])} м" if e["dist_m"] < 1000 else f"{e['dist_m'] / 1000:.1f} км"
         ) if e["dist_m"] != float("inf") else ""
-        dist_part = f"  ({dist_str})" if dist_str else ""
-        lines.append(
-            f"{i}. 🚌 <b>{e['route_num']}</b> → <b>{e['terminal']}</b>\n"
-            f"   🚗 {e['plate']}  ⚡{e['speed']} км/ч  📍 {e['near_stp']}{dist_part}"
-        )
+        dist_part = f" · {dist_str}" if dist_str else ""
+        label = f"🚌 {e['route_num']}  🚗 {e['plate']}  ⚡{e['speed']} км/ч  📍 {e['near_stp']}{dist_part}"
+        vehicle_btns.append([
+            InlineKeyboardButton(label, callback_data=f"where:{e['uid_v']}:{e['route_num']}")
+        ])
+
+    vehicle_btns.append([retry_btn, new_dest_btn])
+    vehicle_btns.append([home_btn])
 
     await edit_fn(
-        f"🚏 <b>{from_stop}</b> → <b>{to_stop}</b>\n\n" + "\n\n".join(lines),
+        f"🚏 <b>{from_stop}</b> → <b>{to_stop}</b>\n\nАвтобусы, которые ещё не доехали до вас:",
         parse_mode=H,
-        reply_markup=InlineKeyboardMarkup([[retry_btn], [new_dest_btn], [home_btn]]),
+        reply_markup=InlineKeyboardMarkup(vehicle_btns),
     )
 
 
