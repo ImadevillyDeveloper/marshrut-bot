@@ -1805,8 +1805,6 @@ def _find_direction_for_stops(mr_id: str, from_stop: str, to_stop: str) -> Optio
             (s.get("st_title") or s.get("st_name") or "").strip()
             for s in race.get("stopList", [])
         ]
-        from_i = next(
-            -1)
         from_i = _find_stop_idx(from_stop, names)
         to_i   = _find_stop_idx(to_stop,   names)
         if from_i != -1 and to_i != -1 and to_i > from_i and names:
