@@ -578,7 +578,10 @@ def _main_menu_markup() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🔔 Мои подписки", callback_data="menu:status"),
             InlineKeyboardButton("💳 Мои карты",    callback_data="menu:cards"),
         ],
-        [InlineKeyboardButton("📍 Найти маршрут", callback_data="geo:start")],
+        [
+            InlineKeyboardButton("📍 Найти по геолокации", callback_data="geo:start"),
+            InlineKeyboardButton("🔍 По остановке",        callback_data="menu:stopsearch"),
+        ],
         [InlineKeyboardButton("❓ Справка", callback_data="menu:help")],
     ])
 
@@ -689,6 +692,11 @@ async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data.get("stopsearch_waiting"):
+        context.user_data.pop("stopsearch_waiting")
+        await _handle_stopsearch(update, context)
+        return
+
     if context.user_data.get("geo_waiting_dest"):
         context.user_data.pop("geo_waiting_dest")
         await _geo_handle_destination(update, context)
@@ -990,6 +998,16 @@ async def on_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         text, base_markup = _cards_text_and_markup(uid)
         buttons = list(base_markup.inline_keyboard) + _BACK_TO_MENU
         await query.edit_message_text(text, parse_mode=H, reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif action == "stopsearch":
+        context.user_data["stopsearch_waiting"] = True
+        await query.edit_message_text(
+            "🔍 <b>Поиск по остановке</b>\n\n"
+            "Введи название остановки (или часть названия).\n"
+            "Например: <i>Гагарина</i>, <i>вокзал</i>, <i>Лобкова</i>",
+            parse_mode=H,
+            reply_markup=InlineKeyboardMarkup(_BACK_TO_MENU),
+        )
 
 
 _TOPUP_BUTTON = InlineKeyboardMarkup([[
@@ -1530,6 +1548,110 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     await context.bot.send_message(chat_id=uid, text=text)
                 except Exception as e:
                     log.warning("send_message uid=%s: %s", uid, e)
+
+
+# ── Поиск по остановке ─────────────────────────────────────────────
+
+def _fetch_active_stops(vehicles: list[dict], max_routes: int = 25) -> None:
+    """Загружает остановки для активных маршрутов, которых ещё нет в кеше."""
+    count = 0
+    seen: set[str] = set()
+    for v in vehicles:
+        mr_num = str(v.get("mr_num", "")).strip().upper()
+        mr_id  = str(v.get("mr_id",  "")).strip()
+        if not mr_num or not mr_id or mr_num in seen:
+            continue
+        seen.add(mr_num)
+        mr_id_cache[mr_num] = mr_id
+        if mr_id not in stops_cache:
+            stops_cache[mr_id] = fetch_route_stops(mr_id)
+            count += 1
+            if count >= max_routes:
+                break
+
+
+async def _handle_stopsearch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ищет маршруты по названию остановки и показывает активные ТС на них."""
+    query_str = (update.message.text or "").strip()
+    home_btn  = InlineKeyboardButton("🏠 Главное меню", callback_data="menu:back")
+
+    msg = await update.message.reply_text("⏳ Ищу остановку...")
+
+    matches = _search_stops_in_cache(query_str)
+    if not matches:
+        await msg.edit_text("⏳ Загружаю данные об остановках...")
+        vehicles = fetch_vehicles()
+        _fetch_active_stops(vehicles)
+        matches = _search_stops_in_cache(query_str)
+    else:
+        vehicles = fetch_vehicles()
+
+    if not matches:
+        await msg.edit_text(
+            f"Не нашли остановку «{query_str}».\n\n"
+            "Проверь написание или попробуй другую часть названия.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔍 Поискать снова", callback_data="menu:stopsearch")],
+                [home_btn],
+            ]),
+        )
+        return
+
+    route_by_mr = {v: k for k, v in mr_id_cache.items()}
+    seen_routes: set[str] = set()
+    lines: list[str] = []
+
+    for stop_name, mr_id in matches[:15]:
+        route_num = route_by_mr.get(mr_id)
+        if not route_num or route_num in seen_routes:
+            continue
+        seen_routes.add(route_num)
+
+        route_vehicles = [
+            v for v in vehicles
+            if str(v.get("mr_num", "")).strip().upper() == route_num
+        ]
+        if not route_vehicles:
+            continue
+
+        vehicle_lines = []
+        for v in route_vehicles[:3]:
+            plate    = str(v.get("u_statenum", "") or "").strip() or "б/н"
+            speed    = int(float(v.get("u_speed", 0) or 0))
+            terminal = str(v.get("rl_laststation_title", "") or "").strip()
+            term_str = f" → {terminal}" if terminal else ""
+            vehicle_lines.append(f"   🚗 {plate}  ⚡{speed} км/ч{term_str}")
+
+        extra = f"\n   <i>+ещё {len(route_vehicles) - 3} ТС</i>" if len(route_vehicles) > 3 else ""
+        lines.append(
+            f"🚌 <b>{route_num}</b>  ({len(route_vehicles)} ТС)\n"
+            + "\n".join(vehicle_lines)
+            + extra
+        )
+
+    if not lines:
+        await msg.edit_text(
+            f"Остановка «{query_str}» найдена, но сейчас нет активных ТС на этих маршрутах.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔍 Поискать снова", callback_data="menu:stopsearch")],
+                [home_btn],
+            ]),
+        )
+        return
+
+    # Buttons to jump to full vehicle list for each found route
+    route_buttons = [
+        [InlineKeyboardButton(f"📍 ТС маршрута {r}", callback_data=f"route:where:{r}")]
+        for r in sorted(seen_routes, key=lambda x: (len(x), x))
+    ]
+    route_buttons.append([InlineKeyboardButton("🔍 Новый поиск", callback_data="menu:stopsearch")])
+    route_buttons.append([home_btn])
+
+    await msg.edit_text(
+        f"🔍 <b>{query_str}</b>\n\n" + "\n\n".join(lines),
+        parse_mode=H,
+        reply_markup=InlineKeyboardMarkup(route_buttons),
+    )
 
 
 # ── Геолокация ─────────────────────────────────────────────────────
