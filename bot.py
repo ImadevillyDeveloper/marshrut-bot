@@ -1270,7 +1270,10 @@ async def on_where_vehicle(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"{terminal_line}"
     )
 
-    await query.edit_message_text(caption, parse_mode=H)
+    back_markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("◀️ К списку ТС", callback_data=f"route:where:{route}")
+    ]])
+    await query.edit_message_text(caption, parse_mode=H, reply_markup=back_markup)
     await context.bot.send_location(
         chat_id=query.message.chat_id,
         latitude=lat,
