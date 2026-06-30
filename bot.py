@@ -268,27 +268,35 @@ def fetch_stop_arrivals(st_id: str) -> list[dict]:
         return []
 
 
-def fetch_stop_id_by_name(query: str) -> Optional[str]:
-    """Ищет st_id остановки через API getStopsByName (не зависит от кеша)."""
+def fetch_stops_by_name_api(query: str) -> list[dict]:
+    """Возвращает [{name, st_id}, ...] из API getStopsByName.
+    Используется когда stops_cache не содержит нужной остановки."""
     try:
         data = _rpc("getStopsByName", {"str": query})
         result = data.get("result", [])
         if not isinstance(result, list):
-            return None
+            return []
+        out = []
         for s in result:
-            name = str(s.get("st_title") or s.get("st_name") or "").strip()
-            if _stop_name_matches(query, name):
-                st_id = str(s.get("st_id") or "").strip()
-                if st_id:
-                    return st_id
-        # Если точного матча нет — берём первый результат
-        if result:
-            st_id = str(result[0].get("st_id") or "").strip()
-            return st_id or None
-        return None
+            name  = str(s.get("st_title") or s.get("st_name") or "").strip()
+            st_id = str(s.get("st_id") or "").strip()
+            if name and st_id:
+                out.append({"name": name, "st_id": st_id})
+        return out
     except Exception as e:
-        log.warning("fetch_stop_id_by_name query=%s: %s", query, e)
-        return None
+        log.warning("fetch_stops_by_name_api query=%s: %s", query, e)
+        return []
+
+
+def fetch_stop_id_by_name(query: str) -> Optional[str]:
+    """Ищет st_id остановки через API getStopsByName (не зависит от кеша)."""
+    matches = fetch_stops_by_name_api(query)
+    # Предпочитаем точное совпадение имени
+    for m in matches:
+        if _stop_name_matches(query, m["name"]):
+            return m["st_id"]
+    # Иначе первый результат
+    return matches[0]["st_id"] if matches else None
 
 
 def _get_stop_id(stop_name: str) -> Optional[str]:
@@ -2264,14 +2272,22 @@ async def _handle_findbus_from_text(update: Update, context: ContextTypes.DEFAUL
         matches = _search_stops_in_cache(stop_query)
 
     if not matches:
-        await msg.edit_text(
-            f"Не нашли остановку «{stop_query}». Попробуй другое название.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Попробовать снова", callback_data="findbus:manual")],
-                [home_btn],
-            ]),
-        )
-        return
+        # Кеш не помог — спрашиваем API напрямую
+        await msg.edit_text("⏳ Ищу через базу остановок...")
+        api_stops = await asyncio.to_thread(fetch_stops_by_name_api, stop_query)
+        # Фильтруем по fuzzy-матчу, чтобы не предлагать несвязанные варианты
+        api_stops = [s for s in api_stops if _stop_name_matches(stop_query, s["name"])]
+        if api_stops:
+            matches = [(s["name"], None) for s in api_stops]
+        else:
+            await msg.edit_text(
+                f"Не нашли остановку «{stop_query}». Попробуй другое название.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Попробовать снова", callback_data="findbus:manual")],
+                    [home_btn],
+                ]),
+            )
+            return
 
     unique_names: list[str] = []
     seen_names: set[str] = set()
