@@ -301,6 +301,12 @@ def _stop_name_matches(query: str, stop_name: str) -> bool:
             return True
         if a.isdigit() or b.isdigit():
             return False  # числа только точно
+        # SequenceMatcher только если слова близки по длине (≤30% разница)
+        la, lb = len(a), len(b)
+        if la < 3 or lb < 3:
+            return False
+        if abs(la - lb) > max(la, lb) * 0.3:
+            return False
         return _SM(None, a, b).ratio() >= 0.82
 
     if all(any(_wm(qw, nw) for nw in n_words) for qw in q_words):
@@ -1912,8 +1918,12 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
     new_dest_btn = InlineKeyboardButton("✏️ Другая конечная",       callback_data="findbus:askdest")
 
     vehicles = fetch_vehicles()
-    # Грузим остановки активных маршрутов; mr_id_cache обновляется для всех без лимита
-    _fetch_active_stops(vehicles)
+    # Обновляем mr_id_cache для всех активных ТС — без HTTP-запросов
+    for _v in vehicles:
+        _rn  = str(_v.get("mr_num", "")).strip().upper()
+        _mid = str(_v.get("mr_id",  "")).strip()
+        if _rn and _mid:
+            mr_id_cache[_rn] = _mid
 
     from_lat = context.user_data.get("findbus_from_lat")
     from_lng = context.user_data.get("findbus_from_lng")
@@ -1927,25 +1937,22 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
             if from_lat:
                 break
 
-    # Прогноз прибытия на начальную остановку через API (тот же источник что окошко на сайте).
-    # getStopArrive возвращает только ТС, которые ещё не проехали остановку — условие "не доехал" выполнено.
+    # Прогноз прибытия через API — только 1 HTTP-запрос.
+    # getStopArrive возвращает только ТС, которые ещё не проехали остановку.
     st_id = _get_stop_id(from_stop)
     arrivals: list[dict] = fetch_stop_arrivals(st_id) if st_id else []
 
-    # Целенаправленно грузим стоп-листы для маршрутов из прогноза, которых ещё нет в кеше.
-    # _fetch_active_stops мог их пропустить из-за лимита 25 маршрутов.
-    if arrivals:
-        forecast_mnums = {str(a.get("mr_num", "")).strip().upper() for a in arrivals}
-        for v in vehicles:
-            rn  = str(v.get("mr_num", "")).strip().upper()
-            mid = str(v.get("mr_id",  "")).strip()
-            if rn not in forecast_mnums or not mid:
-                continue
-            mr_id_cache[rn] = mid
-            if mid not in stops_cache:
-                stops_cache[mid] = fetch_route_stops(mid)
+    # Грузим стоп-листы только для маршрутов из прогноза (5–10 запросов, не 25).
+    # Это гарантирует что нужные маршруты попадут в stops_cache и races_cache.
+    forecast_mnums = {str(a.get("mr_num", "")).strip().upper() for a in arrivals}
+    for _v in vehicles:
+        _rn  = str(_v.get("mr_num", "")).strip().upper()
+        _mid = str(_v.get("mr_id",  "")).strip()
+        if _rn not in forecast_mnums or not _mid:
+            continue
+        if _mid not in stops_cache:
+            stops_cache[_mid] = fetch_route_stops(_mid)
 
-    # После дозагрузки — перепроверяем маршруты
     routes = _find_routes_connecting(from_stop, to_stop)
     if not routes:
         await edit_fn(
