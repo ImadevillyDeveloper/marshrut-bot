@@ -511,9 +511,8 @@ async def subscribe(update: Update, route: str) -> None:
         f"🔔 Маршрут <b>{route}</b>{desc_line}\n\n"
         f"Слежение включено. Сейчас на линии: <b>{count} ТС</b>.\n"
         f"Пришлю уведомление, когда появится новое.\n\n"
-        f"Отслеживаемых маршрутов ({total}): {routes_list}\n\n"
-        f"/stop {route} — снять этот\n"
-        f"/stop — снять все"
+        f"Отслеживаемых маршрутов ({total}): {routes_list}",
+        reply_markup=_track_confirm_markup(route),
     )
 
 
@@ -704,13 +703,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     already = route in subscriptions.get(uid, set())
 
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "✅ Уже отслеживается" if already else "🔔 Отслеживать",
-            callback_data=f"route:track:{route}",
-        ),
-        InlineKeyboardButton("📍 ТС на линии", callback_data=f"route:where:{route}"),
-    ]])
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ Уже отслеживается" if already else "🔔 Отслеживать",
+                callback_data=f"route:track:{route}",
+            ),
+            InlineKeyboardButton("📍 ТС на линии", callback_data=f"route:where:{route}"),
+        ],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:back")],
+    ])
     await update.message.reply_html(
         f"Маршрут <b>{route}</b>{desc_line}\n\nЧто сделать?",
         reply_markup=keyboard,
@@ -742,15 +744,28 @@ def _vehicle_buttons(
     return buttons
 
 
+def _track_confirm_markup(route: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📍 ТС на линии", callback_data=f"route:where:{route}")],
+        [
+            InlineKeyboardButton(f"🛑 Снять {route}", callback_data=f"route:stop:{route}"),
+            InlineKeyboardButton("🏠 Главное меню", callback_data="menu:back"),
+        ],
+    ])
+
+
 def _route_menu_markup(route: str, uid: int) -> InlineKeyboardMarkup:
     already = route in subscriptions.get(uid, set())
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "✅ Уже отслеживается" if already else "🔔 Отслеживать",
-            callback_data=f"route:track:{route}",
-        ),
-        InlineKeyboardButton("📍 ТС на линии", callback_data=f"route:where:{route}"),
-    ]])
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ Уже отслеживается" if already else "🔔 Отслеживать",
+                callback_data=f"route:track:{route}",
+            ),
+            InlineKeyboardButton("📍 ТС на линии", callback_data=f"route:where:{route}"),
+        ],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:back")],
+    ])
 
 
 async def _show_direction_filter(edit_fn, route: str, context, back_uid: Optional[int] = None) -> None:
@@ -862,17 +877,33 @@ async def on_route_action(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"🔔 Маршрут <b>{route}</b>{desc_line}\n\n"
             f"Слежение включено. Сейчас на линии: <b>{count} ТС</b>.\n"
             f"Пришлю уведомление, когда появится новое.\n\n"
-            f"Отслеживаемых маршрутов ({total}): {routes_list}\n\n"
-            f"/stop {route} — снять этот\n/stop — снять все",
+            f"Отслеживаемых маршрутов ({total}): {routes_list}",
             parse_mode=H,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("◀️ Назад", callback_data=f"route:menu:{route}")
-            ]]),
+            reply_markup=_track_confirm_markup(route),
         )
 
     elif action == "where":
         await query.edit_message_text("⏳ Загружаю ТС...", parse_mode=H)
         await _show_direction_filter(query.edit_message_text, route, context, back_uid=uid)
+
+    elif action == "stop":
+        routes_set = subscriptions.get(uid, set())
+        if route in routes_set:
+            routes_set.discard(route)
+            db_remove_sub(uid, route)
+        description = OMSK_ROUTES.get(route, "")
+        desc_line   = f"\n<i>{description}</i>" if description else ""
+        await query.edit_message_text(
+            f"🛑 Маршрут <b>{route}</b>{desc_line} снят с отслеживания.",
+            parse_mode=H,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔔 Снова подписаться", callback_data=f"route:track:{route}")],
+                [
+                    InlineKeyboardButton("🔔 Мои подписки", callback_data="menu:status"),
+                    InlineKeyboardButton("🏠 Главное меню", callback_data="menu:back"),
+                ],
+            ]),
+        )
 
     elif action == "menu":
         description = OMSK_ROUTES.get(route, "")
@@ -921,16 +952,20 @@ async def on_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             text = "У тебя нет активных подписок.\n\n💡 Напиши номер маршрута чтобы начать отслеживать."
             markup = InlineKeyboardMarkup(_BACK_TO_MENU)
         else:
-            lines = []
+            lines   = []
+            buttons = []
             for r in sorted(routes, key=lambda x: (len(x), x)):
                 known = len(known_vehicles.get(r, set()))
                 desc  = OMSK_ROUTES.get(r, "")
                 lines.append(f"🚌 <b>{r}</b> — {desc}\n     На линии: <b>{known} ТС</b>")
+                buttons.append([
+                    InlineKeyboardButton(f"📍 {r}", callback_data=f"route:where:{r}"),
+                    InlineKeyboardButton("🛑", callback_data=f"route:stop:{r}"),
+                ])
+            buttons.append([InlineKeyboardButton("🛑 Снять все", callback_data="menu:stopall")])
+            buttons += _BACK_TO_MENU
             text   = f"🔔 <b>Отслеживаемые маршруты ({len(routes)}):</b>\n\n" + "\n\n".join(lines)
-            markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🛑 Снять все подписки", callback_data="menu:stopall")],
-                *_BACK_TO_MENU,
-            ])
+            markup = InlineKeyboardMarkup(buttons)
         await query.edit_message_text(text, parse_mode=H, reply_markup=markup)
 
     elif action == "stopall":
@@ -1013,7 +1048,12 @@ async def addcard_got_color(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def addcard_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("new_card_number", None)
     context.user_data.pop("new_card_name", None)
-    await update.message.reply_text("Добавление карты отменено.")
+    await update.message.reply_text(
+        "Добавление карты отменено.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 Главное меню", callback_data="menu:back")
+        ]]),
+    )
     return ConversationHandler.END
 
 
