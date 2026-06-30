@@ -274,6 +274,7 @@ def fetch_stops_by_name_api(query: str) -> list[dict]:
     try:
         data = _rpc("getStopsByName", {"str": query})
         result = data.get("result", [])
+        log.info("getStopsByName(%r) → %d results: %s", query, len(result) if isinstance(result, list) else -1, str(result)[:300])
         if not isinstance(result, list):
             return []
         out = []
