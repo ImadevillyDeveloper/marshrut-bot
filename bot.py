@@ -1780,19 +1780,72 @@ def _fetch_active_stops(vehicles: list[dict], max_routes: int = 25) -> None:
                 count += 1
 
 
-def _search_stops_in_cache(query_str: str) -> list[tuple]:
-    """Ищет остановки по названию. Возвращает [(stop_name, mr_id), ...]."""
+def _stop_match_score(query: str, stop_name: str) -> float:
+    """Качество совпадения 0–1. Штрафует остановки, у которых много лишних слов.
+    Например: 'мега' vs 'Торговый центр МЕГА Магазин Леруа Мерлен' → ~0.17
+               'мега' vs 'ТРК Мега' → 0.5     'мега' vs 'Мега' → 1.0"""
+    import re as _re
+    from difflib import SequenceMatcher as _SM
+    q = query.lower().strip()
+    n = stop_name.lower().strip()
+    if q == n:
+        return 1.0
+    q_words = _re.findall(r'[а-яёa-z0-9]+', q)
+    n_words = _re.findall(r'[а-яёa-z0-9]+', n)
+    if not q_words or not n_words:
+        return 0.0
+
+    def _wm(a: str, b: str) -> bool:
+        if a == b: return True
+        if a.isdigit() or b.isdigit(): return False
+        la, lb = len(a), len(b)
+        if la < 3 or lb < 3: return False
+        if abs(la - lb) > max(la, lb) * 0.3: return False
+        return _SM(None, a, b).ratio() >= 0.82
+
+    matched = sum(1 for qw in q_words if any(_wm(qw, nw) for nw in n_words))
+    if matched == 0:
+        return 0.0
+    return matched / max(len(q_words), len(n_words))
+
+
+def _search_stops_in_cache(query_str: str, min_score: float = 0.0) -> list[tuple]:
+    """Ищет остановки по названию. Возвращает [(stop_name, mr_id), ...].
+    min_score > 0 — фильтрует слабые совпадения (запрос покрывает мало слов названия)."""
     results: list[tuple] = []
     seen: set = set()
     for mr_id, stops in stops_cache.items():
         for s in stops:
             name = s["name"]
-            if _stop_name_matches(query_str, name):
-                key = (name, mr_id)
-                if key not in seen:
-                    seen.add(key)
-                    results.append((name, mr_id))
+            if min_score > 0:
+                if _stop_match_score(query_str, name) < min_score:
+                    continue
+            elif not _stop_name_matches(query_str, name):
+                continue
+            key = (name, mr_id)
+            if key not in seen:
+                seen.add(key)
+                results.append((name, mr_id))
     return results
+
+
+async def _fetch_all_active_stops_async(vehicles: list[dict]) -> None:
+    """Загружает стопы ВСЕХ активных маршрутов параллельно (asyncio.gather)."""
+    seen: set[str] = set()
+    to_load: list[str] = []
+    for v in vehicles:
+        mr_num = str(v.get("mr_num", "")).strip().upper()
+        mr_id  = str(v.get("mr_id",  "")).strip()
+        if not mr_num or not mr_id or mr_num in seen:
+            continue
+        seen.add(mr_num)
+        mr_id_cache[mr_num] = mr_id
+        if mr_id not in stops_cache and mr_id not in to_load:
+            to_load.append(mr_id)
+    if to_load:
+        loaded = await asyncio.gather(*[asyncio.to_thread(fetch_route_stops, mid) for mid in to_load])
+        for mid, stops in zip(to_load, loaded):
+            stops_cache[mid] = stops
 
 
 def _find_direction_for_stops(mr_id: str, from_stop: str, to_stop: str) -> Optional[str]:
@@ -2269,17 +2322,24 @@ async def _handle_findbus_from_text(update: Update, context: ContextTypes.DEFAUL
 
     msg = await update.message.reply_text("⏳ Ищу остановку...")
 
-    matches = _search_stops_in_cache(stop_query)
+    # Строгий поиск: запрос должен покрывать ≥40% слов названия остановки.
+    # Это отсекает ложные совпадения вроде «мега» → «Торговый центр МЕГА Магазин Леруа Мерлен»
+    STRICT = 0.4
+    matches = _search_stops_in_cache(stop_query, min_score=STRICT)
     if not matches:
+        # Строгих совпадений нет — грузим ВСЕ активные маршруты параллельно
         await msg.edit_text("⏳ Загружаю данные об остановках...")
         vehicles = await asyncio.to_thread(fetch_vehicles)
-        await asyncio.to_thread(_fetch_active_stops, vehicles)
+        await _fetch_all_active_stops_async(vehicles)
+        matches = _search_stops_in_cache(stop_query, min_score=STRICT)
+
+    if not matches:
+        # После полной загрузки строгих совпадений нет — пробуем мягкий поиск
         matches = _search_stops_in_cache(stop_query)
 
     if not matches:
         await msg.edit_text("⏳ Ищу через базу остановок...")
         api_stops = await asyncio.to_thread(fetch_stops_by_name_api, stop_query)
-        # Фильтруем по fuzzy-матчу, чтобы не предлагать несвязанные варианты
         api_stops = [s for s in api_stops if _stop_name_matches(stop_query, s["name"])]
         if api_stops:
             matches = [(s["name"], None) for s in api_stops]
