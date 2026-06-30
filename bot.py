@@ -907,6 +907,7 @@ def _route_menu_markup(route: str, uid: int) -> InlineKeyboardMarkup:
             ),
             InlineKeyboardButton("📍 ТС на линии", callback_data=f"route:where:{route}"),
         ],
+        [InlineKeyboardButton("🗺 Список остановок", callback_data=f"route:stops:{route}")],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:back")],
     ])
 
@@ -972,8 +973,10 @@ async def on_route_action(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     await query.answer()
 
-    _, action, route = query.data.split(":", 2)
-    uid = query.from_user.id
+    parts  = query.data.split(":", 3)
+    action = parts[1]
+    route  = parts[2] if len(parts) > 2 else ""
+    uid    = query.from_user.id
 
     if action == "track":
         # Логика подписки (аналог subscribe(), но редактирует сообщение)
@@ -1056,6 +1059,111 @@ async def on_route_action(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode=H,
             reply_markup=_route_menu_markup(route, uid),
         )
+
+    elif action == "stops":
+        await query.edit_message_text("⏳ Загружаю остановки...")
+        mr_id = mr_id_cache.get(route)
+        if not mr_id:
+            vehicles = await asyncio.to_thread(fetch_vehicles)
+            for v in vehicles:
+                if str(v.get("mr_num", "")).strip().upper() == route:
+                    mr_id = str(v.get("mr_id", "")).strip()
+                    if mr_id:
+                        mr_id_cache[route] = mr_id
+                        break
+        if mr_id and mr_id not in stops_cache:
+            stops_cache[mr_id] = await asyncio.to_thread(fetch_route_stops, mr_id)
+
+        back_btn = InlineKeyboardButton("◀️ Назад", callback_data=f"route:menu:{route}")
+        home_btn = InlineKeyboardButton("🏠 Главное меню", callback_data="menu:back")
+
+        races = races_cache.get(mr_id, []) if mr_id else []
+        if not races:
+            await query.edit_message_text(
+                f"Маршрут <b>{route}</b>\n\nНе удалось загрузить список остановок.",
+                parse_mode=H,
+                reply_markup=InlineKeyboardMarkup([[back_btn, home_btn]]),
+            )
+            return
+
+        # Уникальные направления по последней остановке рейса
+        seen_dirs: set[str] = set()
+        dirs: list[tuple[int, str]] = []  # (race_idx, terminal_name)
+        for i, race in enumerate(races):
+            stops_list = race.get("stopList", [])
+            if not stops_list:
+                continue
+            terminal = (stops_list[-1].get("st_title") or stops_list[-1].get("st_name") or "").strip()
+            if terminal and terminal not in seen_dirs:
+                seen_dirs.add(terminal)
+                dirs.append((i, terminal))
+
+        if len(dirs) == 1:
+            # Одно направление — сразу показываем
+            context.user_data[f"stops_races:{route}"] = races
+            race_idx, terminal = dirs[0]
+            await _show_route_stops(query.edit_message_text, route, races, race_idx, terminal)
+        else:
+            context.user_data[f"stops_races:{route}"] = races
+            buttons = [
+                [InlineKeyboardButton(f"→ {terminal}", callback_data=f"route:stops_dir:{route}:{i}")]
+                for i, (race_idx, terminal) in enumerate(dirs)
+            ]
+            buttons.append([back_btn, home_btn])
+            await query.edit_message_text(
+                f"🗺 Маршрут <b>{route}</b> — выбери направление:",
+                parse_mode=H,
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+            context.user_data[f"stops_dirs:{route}"] = dirs
+
+    elif action == "stops_dir":
+        # route:stops_dir:ROUTE:DIR_IDX
+        parts   = query.data.split(":", 3)
+        dir_idx = int(parts[3]) if len(parts) > 3 else 0
+        races   = context.user_data.get(f"stops_races:{route}", [])
+        dirs    = context.user_data.get(f"stops_dirs:{route}", [])
+        if not races or not dirs or dir_idx >= len(dirs):
+            await query.edit_message_text("Данные устарели. Попробуй снова.",
+                                          reply_markup=InlineKeyboardMarkup([[
+                                              InlineKeyboardButton("🔄", callback_data=f"route:stops:{route}"),
+                                              InlineKeyboardButton("🏠", callback_data="menu:back"),
+                                          ]]))
+            return
+        race_idx, terminal = dirs[dir_idx]
+        await _show_route_stops(query.edit_message_text, route, races, race_idx, terminal)
+
+
+async def _show_route_stops(edit_fn, route: str, races: list, race_idx: int, terminal: str) -> None:
+    """Показывает нумерованный список остановок для одного направления."""
+    back_btn = InlineKeyboardButton("◀️ Назад к направлениям", callback_data=f"route:stops:{route}")
+    home_btn = InlineKeyboardButton("🏠 Главное меню", callback_data="menu:back")
+
+    stops_list = races[race_idx].get("stopList", [])
+    names = [(s.get("st_title") or s.get("st_name") or "").strip() for s in stops_list]
+    names = [n for n in names if n]
+
+    if not names:
+        await edit_fn(
+            f"🗺 Маршрут <b>{route}</b> → {terminal}\n\nСписок остановок недоступен.",
+            parse_mode=H,
+            reply_markup=InlineKeyboardMarkup([[back_btn], [home_btn]]),
+        )
+        return
+
+    # Нумерованный список; Telegram лимит 4096 символов — обрезаем если нужно
+    lines = [f"🗺 <b>{route}</b> → <b>{terminal}</b>\n"]
+    for i, name in enumerate(names, 1):
+        lines.append(f"{i}. {name}")
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n…"
+
+    await edit_fn(
+        text,
+        parse_mode=H,
+        reply_markup=InlineKeyboardMarkup([[back_btn], [home_btn]]),
+    )
 
 
 _BACK_TO_MENU = [[InlineKeyboardButton("◀️ Главное меню", callback_data="menu:back")]]
