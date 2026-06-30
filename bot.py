@@ -1823,18 +1823,33 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
     st_id = _get_stop_id(from_stop)
     arrivals: list[dict] = fetch_stop_arrivals(st_id) if st_id else []
 
-    # Строим карту (route_num, terminal) → u_id из списка активных ТС (для кнопки детали)
-    # Ключ — нормализованное название конечной
-    uid_map: dict[tuple, str] = {}
+    # Допустимые конечные по каждому маршруту (из _find_routes_connecting)
+    route_terminals: dict[str, str] = {rn: term for rn, _, term in routes}
+    mr_id_by_route:  dict[str, str] = {rn: mid for rn, mid, _ in routes}
+
+    from_lat = context.user_data.get("findbus_from_lat")
+    from_lng = context.user_data.get("findbus_from_lng")
+
+    # Для каждой пары (route_num, direction) — очередь ТС, отсортированная по близости к остановке.
+    # Порядок в очереди соответствует порядку записей в прогнозе (ближайшее ТС = первое прибытие).
+    from collections import defaultdict
+    vehicle_queue: dict[tuple, list[dict]] = defaultdict(list)
     for v in vehicles:
         r_num = str(v.get("mr_num", "")).strip().upper()
         term  = str(v.get("rl_laststation_title", "") or "").strip()
-        u_id  = str(v.get("u_id", ""))
-        if r_num and term and u_id:
-            uid_map[(r_num, term)] = u_id
+        if not v.get("u_lat") or not v.get("u_long"):
+            continue
+        vlat  = float(v["u_lat"])
+        vlng  = float(v["u_long"])
+        mr_id = mr_id_by_route.get(r_num)
+        route_stops = stops_cache.get(mr_id, []) if mr_id else []
+        near_stp = nearest_stop_name(vlat, vlng, route_stops) or ""
+        dist = haversine_m(from_lat, from_lng, vlat, vlng) if (from_lat and from_lng) else float("inf")
+        vehicle_queue[(r_num, term)].append({"u_id": str(v.get("u_id", "")), "near_stp": near_stp, "dist": dist})
+    for q in vehicle_queue.values():
+        q.sort(key=lambda x: x["dist"])
 
-    # Допустимые конечные по каждому маршруту (из _find_routes_connecting)
-    route_terminals: dict[str, str] = {rn: term for rn, _, term in routes}
+    queue_idx: dict[tuple, int] = defaultdict(int)
 
     # Фильтруем прибытия: только маршруты, едущие в сторону to_stop
     all_entries: list[dict] = []
@@ -1847,7 +1862,6 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
         if mr_num not in route_terminals:
             continue
         terminal = route_terminals[mr_num]
-        # Проверяем что направление совпадает с нужной конечной
         if not (arr_dir == terminal
                 or terminal.lower() in arr_dir.lower()
                 or arr_dir.lower() in terminal.lower()):
@@ -1858,13 +1872,22 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
             continue
         seen_arrivals.add(key)
 
-        # Ищем u_id для этого ТС чтобы можно было нажать и посмотреть детали
-        uid_v = uid_map.get((mr_num, arr_dir), "")
+        # Берём следующее по порядку ТС из очереди (ближайшее = первое прибытие)
+        vq_key = (mr_num, arr_dir)
+        idx    = queue_idx[vq_key]
+        veh_list = vehicle_queue.get(vq_key, [])
+        if idx < len(veh_list):
+            uid_v    = veh_list[idx]["u_id"]
+            near_stp = veh_list[idx]["near_stp"]
+            queue_idx[vq_key] += 1
+        else:
+            uid_v    = ""
+            near_stp = ""
 
         all_entries.append({
             "route_num": mr_num,
             "arr_time":  arr_time,
-            "terminal":  arr_dir,
+            "near_stp":  near_stp,
             "uid_v":     uid_v,
         })
 
@@ -1911,12 +1934,16 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
 
     vehicle_btns: list[list[InlineKeyboardButton]] = []
     for e in all_entries[:5]:
+        near = e.get("near_stp") or ""
         if e.get("arr_time"):
-            label = f"🚌 {e['route_num']} → {e['terminal']}  ⏱ {e['arr_time']}"
+            loc_part  = f"  📍 {near}" if near else ""
+            time_part = f"  ⏱ {e['arr_time']}"
+            label = f"🚌 {e['route_num']}{loc_part}{time_part}"
         else:
             dist = e.get("dist_m", float("inf"))
             dist_str = f"{int(dist)} м" if dist < 1000 else f"{dist / 1000:.1f} км"
-            label = f"🚌 {e['route_num']} → {e['terminal']}  📍 {e.get('near_stp', '')} ({dist_str})"
+            loc_part = f"  📍 {near}" if near else ""
+            label = f"🚌 {e['route_num']}{loc_part}  ({dist_str})"
         cb = f"where:{e['uid_v']}:{e['route_num']}" if e["uid_v"] else "findbus:refresh"
         vehicle_btns.append([InlineKeyboardButton(label, callback_data=cb)])
 
