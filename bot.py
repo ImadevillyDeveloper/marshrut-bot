@@ -180,6 +180,20 @@ def init_db() -> None:
             PRIMARY KEY (user_id, card_number)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stops (
+            name  TEXT PRIMARY KEY,
+            st_id TEXT NOT NULL DEFAULT '',
+            lat   REAL NOT NULL DEFAULT 0.0,
+            lng   REAL NOT NULL DEFAULT 0.0
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS known_mr_ids (
+            mr_id     TEXT PRIMARY KEY,
+            route_num TEXT NOT NULL DEFAULT ''
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -249,6 +263,10 @@ def fetch_route_stops(mr_id: str) -> list[dict]:
                         "st_id": str(s.get("st_id") or ""),
                     })
                     seen.add(name)
+        # Обновляем глобальный индекс остановок
+        for s in stops:
+            if s["name"] not in all_stops_index:
+                all_stops_index[s["name"]] = {"st_id": s["st_id"], "lat": s["lat"], "lng": s["lng"]}
         return stops
     except Exception as e:
         log.warning("fetch_route_stops mr_id=%s: %s", mr_id, e)
@@ -349,7 +367,12 @@ def _stop_name_matches(query: str, stop_name: str) -> bool:
 
 
 def _find_stop_idx(query: str, names: list) -> int:
-    """Первый индекс в списке names, совпадающий с query, или -1."""
+    """Первый индекс в списке names, совпадающий с query, или -1.
+    Сначала пробует точное совпадение, затем fuzzy."""
+    try:
+        return names.index(query)
+    except ValueError:
+        pass
     for i, n in enumerate(names):
         if _stop_name_matches(query, n):
             return i
@@ -400,6 +423,58 @@ def db_get_cards(uid: int) -> list[dict]:
     except Exception as e:
         log.warning("db_get_cards: %s", e)
         return []
+
+
+def _db_save_stops(stops: list[dict]) -> None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.executemany(
+            "INSERT OR IGNORE INTO stops (name, st_id, lat, lng) VALUES (?, ?, ?, ?)",
+            [(s["name"], s.get("st_id", ""), s.get("lat", 0.0), s.get("lng", 0.0))
+             for s in stops if s.get("name")],
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning("_db_save_stops: %s", e)
+
+
+def _db_load_stops_into_index() -> None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute("SELECT name, st_id, lat, lng FROM stops").fetchall()
+        conn.close()
+        for name, st_id, lat, lng in rows:
+            if name not in all_stops_index:
+                all_stops_index[name] = {"st_id": st_id, "lat": lat, "lng": lng}
+        log.info("Загружено %d остановок из БД", len(all_stops_index))
+    except Exception as e:
+        log.warning("_db_load_stops_into_index: %s", e)
+
+
+def _db_save_mr_id(route_num: str, mr_id: str) -> None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT OR IGNORE INTO known_mr_ids (mr_id, route_num) VALUES (?, ?)",
+            (mr_id, route_num),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning("_db_save_mr_id: %s", e)
+
+
+def _db_load_known_mr_ids() -> dict[str, str]:
+    """Возвращает {mr_id: route_num} из БД."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute("SELECT mr_id, route_num FROM known_mr_ids").fetchall()
+        conn.close()
+        return {r[0]: r[1] for r in rows}
+    except Exception as e:
+        log.warning("_db_load_known_mr_ids: %s", e)
+        return {}
 
 
 def db_remove_card(uid: int, card_number: str) -> None:
@@ -691,6 +766,11 @@ stops_cache: dict[str, list] = {}
 
 # mr_id -> список рейсов с упорядоченными остановками (для определения направления)
 races_cache: dict[str, list] = {}
+
+# Глобальный индекс всех известных остановок Омска: name → {st_id, lat, lng}
+# Накапливается из stops_cache и персистится в SQLite. Используется для однократного
+# резолвинга пользовательского ввода → официальное название.
+all_stops_index: dict[str, dict] = {}
 
 POLL_INTERVAL = 30  # секунд между проверками
 
@@ -1741,12 +1821,13 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         log.warning("poll_job: ошибка при получении ТС: %s", e)
         return
 
-    # Обновляем mr_id из живых данных
+    # Обновляем mr_id из живых данных, сохраняем новые в БД
     for v in vehicles:
         mr_num = str(v.get("mr_num", "")).strip().upper()
         mr_id  = str(v.get("mr_id", "")).strip()
-        if mr_num and mr_id and mr_num not in mr_id_cache:
+        if mr_num and mr_id and mr_id_cache.get(mr_num) != mr_id:
             mr_id_cache[mr_num] = mr_id
+            _db_save_mr_id(mr_num, mr_id)
 
     # Группируем по маршруту
     by_route: dict[str, list[dict]] = defaultdict(list)
@@ -1927,23 +2008,43 @@ def _search_stops_in_cache(query_str: str, min_score: float = 0.0) -> list[tuple
     return results
 
 
+def _search_stop_index(query: str) -> list[dict]:
+    """Ищет остановки в глобальном индексе. Возвращает [{name, st_id, lat, lng}]."""
+    results = []
+    for name, info in all_stops_index.items():
+        if _stop_name_matches(query, name):
+            results.append({"name": name, **info})
+    return results
+
+
 async def _fetch_all_active_stops_async(vehicles: list[dict]) -> None:
     """Загружает стопы ВСЕХ активных маршрутов параллельно (asyncio.gather)."""
     seen: set[str] = set()
     to_load: list[str] = []
+    new_mr_ids: list[tuple[str, str]] = []  # (route_num, mr_id) для сохранения в БД
     for v in vehicles:
         mr_num = str(v.get("mr_num", "")).strip().upper()
         mr_id  = str(v.get("mr_id",  "")).strip()
         if not mr_num or not mr_id or mr_num in seen:
             continue
         seen.add(mr_num)
-        mr_id_cache[mr_num] = mr_id
+        if mr_id_cache.get(mr_num) != mr_id:
+            mr_id_cache[mr_num] = mr_id
+            new_mr_ids.append((mr_num, mr_id))
         if mr_id not in stops_cache and mr_id not in to_load:
             to_load.append(mr_id)
+    if new_mr_ids:
+        await asyncio.to_thread(
+            lambda: [_db_save_mr_id(rn, mid) for rn, mid in new_mr_ids]
+        )
     if to_load:
         loaded = await asyncio.gather(*[asyncio.to_thread(fetch_route_stops, mid) for mid in to_load])
+        all_new: list[dict] = []
         for mid, stops in zip(to_load, loaded):
             stops_cache[mid] = stops
+            all_new.extend(stops)
+        if all_new:
+            await asyncio.to_thread(_db_save_stops, all_new)
 
 
 def _find_direction_for_stops(mr_id: str, from_stop: str, to_stop: str) -> Optional[str]:
@@ -1994,17 +2095,14 @@ def _find_routes_connecting(
     from_stop: str,
     to_stop: str,
     allowed_mr_ids: Optional[set] = None,
-    from_stop_query: Optional[str] = None,
 ) -> list[tuple]:
     """
     Возвращает [(route_num, mr_id, terminal), ...] — маршруты, по которым можно
-    доехать от from_stop до to_stop напрямую (to_stop стоит после from_stop в рейсе).
+    доехать от from_stop до to_stop напрямую.
+    from_stop и to_stop должны быть официальными названиями из all_stops_index —
+    сравнение идёт по точному совпадению строки (без fuzzy).
     allowed_mr_ids — если задано, проверяются только маршруты из этого множества.
-    from_stop_query — оригинальный короткий запрос пользователя ("мега"), предпочтительнее
-    полного канонического имени для матчинга: исключает ложные совпадения через слова-омонимы
-    (напр. слово "магазин" в названии остановки vs в "Торговый центр МЕГА Магазин...").
     """
-    match_from = from_stop_query or from_stop
     route_by_mr = {v: k for k, v in mr_id_cache.items()}
     results: list[tuple] = []
     seen_routes: set[str] = set()
@@ -2014,11 +2112,10 @@ def _find_routes_connecting(
         route_num = route_by_mr.get(mr_id)
         if not route_num or route_num in seen_routes:
             continue
-        from_found = any(_stop_name_matches(match_from, s["name"]) for s in stops)
-        if not from_found:
+        stop_names = {s["name"] for s in stops}
+        if from_stop not in stop_names:
             continue
-        to_found = any(_stop_name_matches(to_stop, s["name"]) for s in stops)
-        if not to_found:
+        if to_stop not in stop_names:
             continue
         terminal = _find_direction_for_stops(mr_id, from_stop, to_stop)
         if terminal:
@@ -2159,8 +2256,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
 
     # Ищем только среди маршрутов из прогноза, а не по всему stops_cache
     # (иначе старые записи кеша дают ложные совпадения с чужими маршрутами)
-    from_stop_query = context.user_data.get("findbus_from_query")
-    routes = _find_routes_connecting(from_stop, to_stop, forecast_mr_ids or None, from_stop_query=from_stop_query)
+    routes = _find_routes_connecting(from_stop, to_stop, forecast_mr_ids or None)
     log.info("findbus: routes=%s", [(r[0], r[2]) for r in routes])
     if not routes:
         await edit_fn(
@@ -2408,6 +2504,16 @@ async def on_findbus_action(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             reply_markup=InlineKeyboardMarkup([[home_btn]]),
         )
 
+    elif action == "to_pick":
+        idx  = int(parts[2]) if len(parts) > 2 else 0
+        opts = context.user_data.get("findbus_to_opts", [])
+        if idx < len(opts):
+            context.user_data["findbus_to_stop"] = opts[idx]
+        from_stop = context.user_data.get("findbus_from_stop", "")
+        to_stop   = context.user_data.get("findbus_to_stop", "")
+        await query.edit_message_text("⏳ Ищу маршруты...")
+        await _show_findbus_results(query.edit_message_text, context, from_stop, to_stop)
+
     elif action == "askdest":
         stop = context.user_data.get("findbus_from_stop", "")
         context.user_data["findbus_waiting_dest"] = True
@@ -2432,39 +2538,27 @@ async def _handle_findbus_from_text(update: Update, context: ContextTypes.DEFAUL
 
     msg = await update.message.reply_text("⏳ Ищу остановку...")
 
-    matches = _search_stops_in_cache(stop_query)
+    matches = _search_stop_index(stop_query)
     if not matches:
         await msg.edit_text("⏳ Загружаю данные об остановках...")
         vehicles = await asyncio.to_thread(fetch_vehicles)
         await _fetch_all_active_stops_async(vehicles)
-        matches = _search_stops_in_cache(stop_query)
+        matches = _search_stop_index(stop_query)
 
     if not matches:
-        await msg.edit_text("⏳ Ищу через базу остановок...")
-        api_stops = await asyncio.to_thread(fetch_stops_by_name_api, stop_query)
-        api_stops = [s for s in api_stops if _stop_name_matches(stop_query, s["name"])]
-        if api_stops:
-            matches = [(s["name"], None) for s in api_stops]
-        else:
-            await msg.edit_text(
-                f"Не нашли остановку «{stop_query}». Попробуй другое название.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Попробовать снова", callback_data="findbus:manual")],
-                    [home_btn],
-                ]),
-            )
-            return
+        await msg.edit_text(
+            f"Не нашли остановку «{stop_query}». Попробуй другое название.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Попробовать снова", callback_data="findbus:manual")],
+                [home_btn],
+            ]),
+        )
+        return
 
-    unique_names: list[str] = []
-    seen_names: set[str] = set()
-    for name, _ in matches:
-        if name not in seen_names:
-            seen_names.add(name)
-            unique_names.append(name)
+    unique_names = list(dict.fromkeys(m["name"] for m in matches))
 
     if len(unique_names) == 1:
         context.user_data["findbus_from_stop"]    = unique_names[0]
-        context.user_data["findbus_from_query"]   = stop_query
         context.user_data["findbus_waiting_dest"] = True
         other_btn = InlineKeyboardButton("✏️ Другая остановка", callback_data="findbus:manual")
         await msg.edit_text(
@@ -2474,8 +2568,7 @@ async def _handle_findbus_from_text(update: Update, context: ContextTypes.DEFAUL
             reply_markup=InlineKeyboardMarkup([[other_btn], [home_btn]]),
         )
     else:
-        context.user_data["findbus_from_opts"]  = unique_names[:4]
-        context.user_data["findbus_from_query"] = stop_query
+        context.user_data["findbus_from_opts"] = unique_names[:4]
         buttons = [
             [InlineKeyboardButton(n, callback_data=f"findbus:from_pick:{i}")]
             for i, n in enumerate(unique_names[:4])
@@ -2488,13 +2581,47 @@ async def _handle_findbus_from_text(update: Update, context: ContextTypes.DEFAUL
 
 
 async def _handle_findbus_dest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает ввод конечной остановки и показывает маршруты."""
+    """Обрабатывает ввод конечной остановки — резолвит в официальное имя, затем ищет маршруты."""
     dest_text = (update.message.text or "").strip()
     from_stop = context.user_data.get("findbus_from_stop", "")
+    home_btn  = InlineKeyboardButton("🏠 Главное меню", callback_data="menu:back")
 
-    context.user_data["findbus_to_stop"] = dest_text
-    msg = await update.message.reply_text("⏳ Ищу маршруты...")
-    await _show_findbus_results(msg.edit_text, context, from_stop, dest_text)
+    msg = await update.message.reply_text("⏳ Ищу остановку...")
+
+    matches = _search_stop_index(dest_text)
+    if not matches:
+        await msg.edit_text("⏳ Загружаю данные об остановках...")
+        vehicles = await asyncio.to_thread(fetch_vehicles)
+        await _fetch_all_active_stops_async(vehicles)
+        matches = _search_stop_index(dest_text)
+
+    if not matches:
+        await msg.edit_text(
+            f"Не нашли остановку «{dest_text}». Попробуй другое название.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ Попробовать снова", callback_data="findbus:askdest")],
+                [home_btn],
+            ]),
+        )
+        return
+
+    unique_names = list(dict.fromkeys(m["name"] for m in matches))
+
+    if len(unique_names) == 1:
+        to_stop = unique_names[0]
+        context.user_data["findbus_to_stop"] = to_stop
+        await _show_findbus_results(msg.edit_text, context, from_stop, to_stop)
+    else:
+        context.user_data["findbus_to_opts"] = unique_names[:4]
+        buttons = [
+            [InlineKeyboardButton(n, callback_data=f"findbus:to_pick:{i}")]
+            for i, n in enumerate(unique_names[:4])
+        ]
+        buttons.append([home_btn])
+        await msg.edit_text(
+            "Нашли несколько похожих остановок. Выбери конечную:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
 
 
 # ── Health-check сервер (для Render / UptimeRobot) ─────────────────
@@ -2518,6 +2645,30 @@ def _start_health_server() -> None:
     log.info("Health-check сервер запущен на порту %d", port)
 
 
+async def _warmup_stops_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """При старте загружает стопы всех известных маршрутов из Navitrans в фоне."""
+    known = _db_load_known_mr_ids()
+    to_load = [mid for mid in known if mid not in stops_cache]
+    if not to_load:
+        log.info("Warmup: все известные маршруты уже в кеше (%d остановок)", len(all_stops_index))
+        return
+    log.info("Warmup: загружаем %d маршрутов из БД", len(to_load))
+    loaded = await asyncio.gather(
+        *[asyncio.to_thread(fetch_route_stops, mid) for mid in to_load],
+        return_exceptions=True,
+    )
+    new_stops: list[dict] = []
+    for mid, result in zip(to_load, loaded):
+        if isinstance(result, Exception):
+            log.warning("Warmup: ошибка загрузки mr_id=%s: %s", mid, result)
+            continue
+        stops_cache[mid] = result
+        new_stops.extend(result)
+    if new_stops:
+        await asyncio.to_thread(_db_save_stops, new_stops)
+    log.info("Warmup: готово, индекс остановок: %d остановок", len(all_stops_index))
+
+
 # ── Запуск ─────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -2534,6 +2685,12 @@ def main() -> None:
         for uid, routes in loaded.items():
             subscriptions[uid] = routes
         log.info("Загружено подписок из БД: %d пользователей", len(loaded))
+        # Загружаем глобальный индекс остановок из БД (персистентный кеш)
+        _db_load_stops_into_index()
+        # Восстанавливаем mr_id_cache из БД
+        for mid, rn in _db_load_known_mr_ids().items():
+            if rn and rn not in mr_id_cache:
+                mr_id_cache[rn] = mid
 
         await application.bot.delete_webhook(drop_pending_updates=True)
         await application.bot.set_my_commands([
@@ -2583,6 +2740,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     app.job_queue.run_repeating(poll_job, interval=POLL_INTERVAL, first=15)
+    app.job_queue.run_once(_warmup_stops_job, when=10)
 
     log.info("Бот запущен. Интервал опроса: %d сек.", POLL_INTERVAL)
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
