@@ -846,19 +846,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     already = route in subscriptions.get(uid, set())
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "✅ Уже отслеживается" if already else "🔔 Отслеживать",
-                callback_data=f"route:track:{route}",
-            ),
-            InlineKeyboardButton("📍 ТС на линии", callback_data=f"route:where:{route}"),
-        ],
-        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:back")],
-    ])
     await update.message.reply_html(
         f"Маршрут <b>{route}</b>{desc_line}\n\nЧто сделать?",
-        reply_markup=keyboard,
+        reply_markup=_route_menu_markup(route, uid),
     )
 
 
