@@ -715,6 +715,69 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _vehicle_buttons(route: str, route_vehicles: list[dict]) -> list[list[InlineKeyboardButton]]:
+    buttons = []
+    for v in route_vehicles:
+        plate    = str(v.get("u_statenum", "") or "").strip() or "б/н"
+        uid_v    = str(v.get("u_id", ""))
+        speed    = int(float(v.get("u_speed", 0) or 0))
+        terminal = str(v.get("rl_laststation_title", "") or "").strip()
+        label    = f"🚌 {plate}  {speed} км/ч"
+        if terminal:
+            label += f"  → {terminal}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"where:{uid_v}:{route}")])
+    return buttons
+
+
+async def _show_direction_filter(edit_fn, route: str, context) -> None:
+    """Показывает фильтр по направлениям или сразу список ТС (если направление одно)."""
+    vehicles = fetch_vehicles()
+    route_vehicles = [
+        v for v in vehicles
+        if str(v.get("mr_num", "")).strip().upper() == route
+        and v.get("u_lat") and v.get("u_long")
+    ]
+
+    description = OMSK_ROUTES.get(route, "")
+    header = f"📍 Маршрут <b>{route}</b>"
+    if description:
+        header += f"\n<i>{description}</i>"
+
+    if not route_vehicles:
+        await edit_fn(header + "\n\nСейчас нет ТС на линии.", parse_mode=H)
+        return
+
+    # Уникальные направления, сохраняем порядок появления
+    terminals: list[str] = []
+    seen: set[str] = set()
+    for v in route_vehicles:
+        t = str(v.get("rl_laststation_title", "") or "").strip()
+        if t and t not in seen:
+            terminals.append(t)
+            seen.add(t)
+
+    context.user_data[f"filter_terms:{route}"] = terminals
+
+    if len(terminals) <= 1:
+        # Одно направление или нет данных — сразу список
+        await edit_fn(
+            header + f"\n\nНа линии <b>{len(route_vehicles)} ТС</b>. Выбери автобус:",
+            parse_mode=H,
+            reply_markup=InlineKeyboardMarkup(_vehicle_buttons(route, route_vehicles)),
+        )
+        return
+
+    buttons = [[InlineKeyboardButton("🚌 Все ТС", callback_data=f"filter:{route}:all")]]
+    for i, t in enumerate(terminals):
+        buttons.append([InlineKeyboardButton(f"→ {t}", callback_data=f"filter:{route}:{i}")])
+
+    await edit_fn(
+        header + f"\n\nНа линии <b>{len(route_vehicles)} ТС</b>. Выбери направление:",
+        parse_mode=H,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
 async def on_route_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -774,37 +837,7 @@ async def on_route_action(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     elif action == "where":
         await query.edit_message_text("⏳ Загружаю ТС...", parse_mode=H)
-        vehicles = fetch_vehicles()
-        route_vehicles = [
-            v for v in vehicles
-            if str(v.get("mr_num", "")).strip().upper() == route
-            and v.get("u_lat") and v.get("u_long")
-        ]
-        description = OMSK_ROUTES.get(route, "")
-        header = f"📍 Маршрут <b>{route}</b>"
-        if description:
-            header += f"\n<i>{description}</i>"
-
-        if not route_vehicles:
-            await query.edit_message_text(header + "\n\nСейчас нет ТС на линии.", parse_mode=H)
-            return
-
-        buttons = []
-        for v in route_vehicles:
-            plate    = str(v.get("u_statenum", "") or "").strip() or "б/н"
-            uid_v    = str(v.get("u_id", ""))
-            speed    = int(float(v.get("u_speed", 0) or 0))
-            terminal = str(v.get("rl_laststation_title", "") or "").strip()
-            label    = f"🚌 {plate}  {speed} км/ч"
-            if terminal:
-                label += f"  → {terminal}"
-            buttons.append([InlineKeyboardButton(label, callback_data=f"where:{uid_v}:{route}")])
-
-        await query.edit_message_text(
-            header + f"\n\nНа линии <b>{len(route_vehicles)} ТС</b>. Выбери автобус:",
-            parse_mode=H,
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+        await _show_direction_filter(query.edit_message_text, route, context)
 
 
 _TOPUP_BUTTON = InlineKeyboardMarkup([[
@@ -1101,6 +1134,15 @@ async def cmd_where(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     route = context.args[0].strip().upper()
     msg = await update.message.reply_text(f"⏳ Загружаю ТС маршрута {route}...")
+    await _show_direction_filter(msg.edit_text, route, context)
+
+
+async def on_filter_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    _, route, idx_str = query.data.split(":", 2)
+    await query.edit_message_text("⏳ Загружаю ТС...")
 
     vehicles = fetch_vehicles()
     route_vehicles = [
@@ -1109,28 +1151,38 @@ async def cmd_where(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         and v.get("u_lat") and v.get("u_long")
     ]
 
-    if not route_vehicles:
-        await msg.edit_text(f"Маршрут {route}: сейчас нет ТС на линии.")
-        return
-
-    buttons = []
-    for v in route_vehicles:
-        plate    = str(v.get("u_statenum", "") or "").strip() or "б/н"
-        uid_v    = str(v.get("u_id", ""))
-        speed    = int(float(v.get("u_speed", 0) or 0))
-        terminal = str(v.get("rl_laststation_title", "") or "").strip()
-        label    = f"🚌 {plate}  {speed} км/ч"
-        if terminal:
-            label += f"  → {terminal}"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"where:{uid_v}:{route}")])
-
     description = OMSK_ROUTES.get(route, "")
     header = f"📍 Маршрут <b>{route}</b>"
     if description:
         header += f"\n<i>{description}</i>"
 
-    await msg.edit_text(
-        header + f"\n\nНа линии <b>{len(route_vehicles)} ТС</b>. Выбери автобус:",
+    back_btn = InlineKeyboardButton("◀️ Назад к фильтру", callback_data=f"route:where:{route}")
+
+    if idx_str == "all":
+        filtered   = route_vehicles
+        dir_suffix = ""
+    else:
+        terminals     = context.user_data.get(f"filter_terms:{route}", [])
+        idx           = int(idx_str)
+        terminal_name = terminals[idx] if idx < len(terminals) else ""
+        filtered = [
+            v for v in route_vehicles
+            if str(v.get("rl_laststation_title", "") or "").strip() == terminal_name
+        ] if terminal_name else route_vehicles
+        dir_suffix = f"\n→ <b>{terminal_name}</b>" if terminal_name else ""
+
+    if not filtered:
+        await query.edit_message_text(
+            header + dir_suffix + "\n\nСейчас нет ТС в этом направлении.",
+            parse_mode=H,
+            reply_markup=InlineKeyboardMarkup([[back_btn]]),
+        )
+        return
+
+    buttons = _vehicle_buttons(route, filtered)
+    buttons.append([back_btn])
+    await query.edit_message_text(
+        header + dir_suffix + f"\n\nНа линии <b>{len(filtered)} ТС</b>. Выбери автобус:",
         parse_mode=H,
         reply_markup=InlineKeyboardMarkup(buttons),
     )
@@ -1378,8 +1430,9 @@ def main() -> None:
         },
         fallbacks=[CommandHandler("cancel", addcard_cancel)],
     ))
-    app.add_handler(CallbackQueryHandler(on_card_action,   pattern=r"^card:"))
+    app.add_handler(CallbackQueryHandler(on_card_action,    pattern=r"^card:"))
     app.add_handler(CallbackQueryHandler(on_route_action,  pattern=r"^route:"))
+    app.add_handler(CallbackQueryHandler(on_filter_action, pattern=r"^filter:"))
     app.add_handler(CallbackQueryHandler(on_where_vehicle, pattern=r"^where:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
