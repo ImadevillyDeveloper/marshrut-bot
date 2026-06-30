@@ -740,8 +740,20 @@ def _vehicle_buttons(
     return buttons
 
 
-async def _show_direction_filter(edit_fn, route: str, context) -> None:
-    """Показывает фильтр по направлениям или сразу список ТС (если направление одно)."""
+def _route_menu_markup(route: str, uid: int) -> InlineKeyboardMarkup:
+    already = route in subscriptions.get(uid, set())
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "✅ Уже отслеживается" if already else "🔔 Отслеживать",
+            callback_data=f"route:track:{route}",
+        ),
+        InlineKeyboardButton("📍 ТС на линии", callback_data=f"route:where:{route}"),
+    ]])
+
+
+async def _show_direction_filter(edit_fn, route: str, context, back_uid: Optional[int] = None) -> None:
+    """Показывает фильтр по направлениям или сразу список ТС (если направление одно).
+    back_uid: если передан, добавляет кнопку «Назад» к меню маршрута."""
     vehicles = fetch_vehicles()
     route_vehicles = [
         v for v in vehicles
@@ -754,8 +766,14 @@ async def _show_direction_filter(edit_fn, route: str, context) -> None:
     if description:
         header += f"\n<i>{description}</i>"
 
+    back_row = [[InlineKeyboardButton("◀️ Назад", callback_data=f"route:menu:{route}")]] if back_uid is not None else []
+
     if not route_vehicles:
-        await edit_fn(header + "\n\nСейчас нет ТС на линии.", parse_mode=H)
+        await edit_fn(
+            header + "\n\nСейчас нет ТС на линии.",
+            parse_mode=H,
+            reply_markup=InlineKeyboardMarkup(back_row) if back_row else None,
+        )
         return
 
     # Уникальные направления, сохраняем порядок появления
@@ -770,17 +788,18 @@ async def _show_direction_filter(edit_fn, route: str, context) -> None:
     context.user_data[f"filter_terms:{route}"] = terminals
 
     if len(terminals) <= 1:
-        # Одно направление или нет данных — сразу список
+        buttons = _vehicle_buttons(route, route_vehicles) + back_row
         await edit_fn(
             header + f"\n\nНа линии <b>{len(route_vehicles)} ТС</b>. Выбери автобус:",
             parse_mode=H,
-            reply_markup=InlineKeyboardMarkup(_vehicle_buttons(route, route_vehicles)),
+            reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
 
     buttons = [[InlineKeyboardButton("🚌 Все ТС", callback_data=f"filter:{route}:all")]]
     for i, t in enumerate(terminals):
         buttons.append([InlineKeyboardButton(f"→ {t}", callback_data=f"filter:{route}:{i}")])
+    buttons += back_row
 
     await edit_fn(
         header + f"\n\nНа линии <b>{len(route_vehicles)} ТС</b>. Выбери направление:",
@@ -844,11 +863,23 @@ async def on_route_action(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"Отслеживаемых маршрутов ({total}): {routes_list}\n\n"
             f"/stop {route} — снять этот\n/stop — снять все",
             parse_mode=H,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад", callback_data=f"route:menu:{route}")
+            ]]),
         )
 
     elif action == "where":
         await query.edit_message_text("⏳ Загружаю ТС...", parse_mode=H)
-        await _show_direction_filter(query.edit_message_text, route, context)
+        await _show_direction_filter(query.edit_message_text, route, context, back_uid=uid)
+
+    elif action == "menu":
+        description = OMSK_ROUTES.get(route, "")
+        desc_line   = f"\n<i>{description}</i>" if description else ""
+        await query.edit_message_text(
+            f"Маршрут <b>{route}</b>{desc_line}\n\nЧто сделать?",
+            parse_mode=H,
+            reply_markup=_route_menu_markup(route, uid),
+        )
 
 
 _TOPUP_BUTTON = InlineKeyboardMarkup([[
@@ -1229,7 +1260,12 @@ async def on_where_vehicle(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
     if not v:
-        await query.edit_message_text("ТС уже не на линии.")
+        await query.edit_message_text(
+            "ТС уже не на линии.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ К списку ТС", callback_data=f"route:where:{route}")
+            ]]),
+        )
         return
 
     lat    = float(v.get("u_lat",  0) or 0)
