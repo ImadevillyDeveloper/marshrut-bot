@@ -1690,6 +1690,24 @@ def _find_direction_for_stops(mr_id: str, from_stop: str, to_stop: str) -> Optio
     return None
 
 
+def _direction_is_correct(mr_id: str, arr_dir: str, from_stop: str, to_stop: str) -> bool:
+    """True если рейс mr_id с конечной arr_dir везёт from_stop → to_stop в правильном порядке."""
+    races = races_cache.get(mr_id, [])
+    ad = arr_dir.lower()
+    for race in races:
+        names = [(s.get("st_title") or s.get("st_name") or "").strip() for s in race.get("stopList", [])]
+        if not names:
+            continue
+        last = names[-1].lower()
+        if not (last == ad or ad in last or last in ad):
+            continue
+        from_i = next((i for i, n in enumerate(names) if from_stop.lower() in n.lower() or n.lower() in from_stop.lower()), -1)
+        to_i   = next((i for i, n in enumerate(names) if to_stop.lower()   in n.lower() or n.lower() in to_stop.lower()),   -1)
+        if from_i != -1 and to_i != -1 and to_i > from_i:
+            return True
+    return False
+
+
 def _find_routes_connecting(from_stop: str, to_stop: str) -> list[tuple]:
     """
     Возвращает [(route_num, mr_id, terminal), ...] — маршруты, по которым можно
@@ -1819,52 +1837,52 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
     from_display = _canonical_stop_name(from_stop)
     to_display   = _canonical_stop_name(to_stop)
 
-    # Прогноз прибытия на начальную остановку через API (то же что и окошко на сайте)
-    st_id = _get_stop_id(from_stop)
-    arrivals: list[dict] = fetch_stop_arrivals(st_id) if st_id else []
-
-    # Допустимые конечные по каждому маршруту (из _find_routes_connecting)
-    route_terminals: dict[str, str] = {rn: term for rn, _, term in routes}
-    mr_id_by_route:  dict[str, str] = {rn: mid for rn, mid, _ in routes}
-
     from_lat = context.user_data.get("findbus_from_lat")
     from_lng = context.user_data.get("findbus_from_lng")
 
-    # Для каждой пары (route_num, direction) — очередь ТС, отсортированная по близости к остановке.
-    # Порядок в очереди соответствует порядку записей в прогнозе (ближайшее ТС = первое прибытие).
+    # Прогноз прибытия на начальную остановку через API (тот же источник что окошко на сайте).
+    # getStopArrive возвращает только ТС, которые ещё не проехали остановку — условие "не доехал" выполнено.
+    st_id = _get_stop_id(from_stop)
+    arrivals: list[dict] = fetch_stop_arrivals(st_id) if st_id else []
+
+    # Список ТС по маршруту, отсортированный по расстоянию до from_stop.
+    # Используется чтобы сопоставить прибытие из прогноза с конкретным ТС (для near_stp и u_id).
     from collections import defaultdict
-    vehicle_queue: dict[tuple, list[dict]] = defaultdict(list)
+    vehicle_list: dict[str, list[dict]] = defaultdict(list)
     for v in vehicles:
         r_num = str(v.get("mr_num", "")).strip().upper()
-        term  = str(v.get("rl_laststation_title", "") or "").strip()
         if not v.get("u_lat") or not v.get("u_long"):
             continue
-        vlat  = float(v["u_lat"])
-        vlng  = float(v["u_long"])
-        mr_id = mr_id_by_route.get(r_num)
+        vlat = float(v["u_lat"])
+        vlng = float(v["u_long"])
+        mr_id = mr_id_cache.get(r_num, "")
         route_stops = stops_cache.get(mr_id, []) if mr_id else []
         near_stp = nearest_stop_name(vlat, vlng, route_stops) or ""
         dist = haversine_m(from_lat, from_lng, vlat, vlng) if (from_lat and from_lng) else float("inf")
-        vehicle_queue[(r_num, term)].append({"u_id": str(v.get("u_id", "")), "near_stp": near_stp, "dist": dist})
-    for q in vehicle_queue.values():
-        q.sort(key=lambda x: x["dist"])
+        vehicle_list[r_num].append({
+            "u_id": str(v.get("u_id", "")),
+            "term": str(v.get("rl_laststation_title", "") or "").strip(),
+            "near_stp": near_stp,
+            "dist": dist,
+        })
+    for lst in vehicle_list.values():
+        lst.sort(key=lambda x: x["dist"])
 
-    queue_idx: dict[tuple, int] = defaultdict(int)
-
-    # Фильтруем прибытия: только маршруты, едущие в сторону to_stop
+    # Фильтруем прибытия: маршрут в данном направлении должен везти from_stop → to_stop.
+    # Проверка идёт напрямую по races_cache — не зависит от совпадения строки конечной.
     all_entries: list[dict] = []
     seen_arrivals: set[tuple] = set()
+    assigned_uids: set[str] = set()
+
     for arr in arrivals:
         mr_num   = str(arr.get("mr_num", "")).strip().upper()
         arr_time = str(arr.get("tc_arrivetime", "")).strip()
         arr_dir  = str(arr.get("laststation_title", "")).strip()
 
-        if mr_num not in route_terminals:
+        mr_id = mr_id_cache.get(mr_num)
+        if not mr_id:
             continue
-        terminal = route_terminals[mr_num]
-        if not (arr_dir == terminal
-                or terminal.lower() in arr_dir.lower()
-                or arr_dir.lower() in terminal.lower()):
+        if not _direction_is_correct(mr_id, arr_dir, from_stop, to_stop):
             continue
 
         key = (mr_num, arr_time, arr_dir)
@@ -1872,17 +1890,18 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
             continue
         seen_arrivals.add(key)
 
-        # Берём следующее по порядку ТС из очереди (ближайшее = первое прибытие)
-        vq_key = (mr_num, arr_dir)
-        idx    = queue_idx[vq_key]
-        veh_list = vehicle_queue.get(vq_key, [])
-        if idx < len(veh_list):
-            uid_v    = veh_list[idx]["u_id"]
-            near_stp = veh_list[idx]["near_stp"]
-            queue_idx[vq_key] += 1
-        else:
-            uid_v    = ""
-            near_stp = ""
+        # Ищем ближайшее незанятое ТС с совпадающим маршрутом и направлением
+        uid_v = ""
+        near_stp = ""
+        for candidate in vehicle_list.get(mr_num, []):
+            if candidate["u_id"] in assigned_uids:
+                continue
+            t = candidate["term"]
+            if t == arr_dir or arr_dir.lower() in t.lower() or t.lower() in arr_dir.lower():
+                uid_v    = candidate["u_id"]
+                near_stp = candidate["near_stp"]
+                assigned_uids.add(uid_v)
+                break
 
         all_entries.append({
             "route_num": mr_num,
@@ -1892,7 +1911,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
         })
 
     if not all_entries:
-        # Прогноза нет (нерабочее время или st_id не найден) — откат к старому методу по ТС
+        # Откат: нет прогноза (нерабочее время / st_id не найден) — ищем по активным ТС
         all_entries_fallback: list[dict] = []
         for route_num, mr_id, terminal in routes:
             route_stops = stops_cache.get(mr_id, [])
@@ -1901,25 +1920,17 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
                     continue
                 if not v.get("u_lat") or not v.get("u_long"):
                     continue
-                v_terminal = str(v.get("rl_laststation_title", "") or "").strip()
-                if not (v_terminal == terminal
-                        or terminal.lower() in v_terminal.lower()
-                        or v_terminal.lower() in terminal.lower()):
-                    continue
                 vlat = float(v["u_lat"])
                 vlng = float(v["u_long"])
                 if not _vehicle_is_before_stop(mr_id, terminal, vlat, vlng, from_stop):
                     continue
-                from_lat = context.user_data.get("findbus_from_lat")
-                from_lng = context.user_data.get("findbus_from_lng")
                 dist_m   = haversine_m(from_lat, from_lng, vlat, vlng) if (from_lat and from_lng) else float("inf")
                 near_stp = nearest_stop_name(vlat, vlng, route_stops) or "нет данных"
                 all_entries_fallback.append({
                     "route_num": route_num,
                     "arr_time":  None,
-                    "terminal":  terminal,
-                    "uid_v":     str(v.get("u_id", "")),
                     "near_stp":  near_stp,
+                    "uid_v":     str(v.get("u_id", "")),
                     "dist_m":    dist_m,
                 })
         all_entries_fallback.sort(key=lambda x: x["dist_m"])
