@@ -270,15 +270,52 @@ def fetch_stop_arrivals(st_id: str) -> list[dict]:
 
 def _get_stop_id(stop_name: str) -> Optional[str]:
     """Ищет st_id остановки по имени в stops_cache."""
-    q = stop_name.lower()
     for stops in stops_cache.values():
         for s in stops:
-            n = s["name"].lower()
-            if q in n or n in q:
+            if _stop_name_matches(stop_name, s["name"]):
                 st_id = s.get("st_id")
                 if st_id:
                     return st_id
     return None
+
+
+def _stop_name_matches(query: str, stop_name: str) -> bool:
+    """Надёжное сравнение введённого названия остановки с именем из базы.
+    - Числа сравниваются точно: '4-я' ≠ '14-я'
+    - Остальные слова: точно или с допуском на опечатку (SequenceMatcher ≥ 0.82)
+    - Все слова запроса должны найтись в названии (или наоборот для коротких имён)
+    """
+    import re as _re
+    from difflib import SequenceMatcher as _SM
+    q = query.lower().strip()
+    n = stop_name.lower().strip()
+    if q == n:
+        return True
+    q_words = _re.findall(r'[а-яёa-z0-9]+', q)
+    n_words = _re.findall(r'[а-яёa-z0-9]+', n)
+    if not q_words:
+        return False
+
+    def _wm(a: str, b: str) -> bool:
+        if a == b:
+            return True
+        if a.isdigit() or b.isdigit():
+            return False  # числа только точно
+        return _SM(None, a, b).ratio() >= 0.82
+
+    if all(any(_wm(qw, nw) for nw in n_words) for qw in q_words):
+        return True
+    if n_words and all(any(_wm(nw, qw) for qw in q_words) for nw in n_words):
+        return True
+    return False
+
+
+def _find_stop_idx(query: str, names: list) -> int:
+    """Первый индекс в списке names, совпадающий с query, или -1."""
+    for i, n in enumerate(names):
+        if _stop_name_matches(query, n):
+            return i
+    return -1
 
 
 def _canonical_stop_name(query: str) -> str:
@@ -291,8 +328,7 @@ def _canonical_stop_name(query: str) -> str:
         for s in stops:
             n = s["name"]
             nl = n.lower()
-            if q in nl or nl in q:
-                # Предпочитаем точное совпадение, потом самое короткое (конкретное)
+            if _stop_name_matches(q, n):
                 if nl == q:
                     return n
                 if len(n) > best_len:
@@ -1707,14 +1743,13 @@ def _fetch_active_stops(vehicles: list[dict], max_routes: int = 25) -> None:
 
 
 def _search_stops_in_cache(query_str: str) -> list[tuple]:
-    """Ищет остановки по подстроке. Возвращает [(stop_name, mr_id), ...]."""
-    q = query_str.lower().strip()
+    """Ищет остановки по названию. Возвращает [(stop_name, mr_id), ...]."""
     results: list[tuple] = []
     seen: set = set()
     for mr_id, stops in stops_cache.items():
         for s in stops:
             name = s["name"]
-            if q in name.lower() or name.lower() in q:
+            if _stop_name_matches(query_str, name):
                 key = (name, mr_id)
                 if key not in seen:
                     seen.add(key)
@@ -1742,13 +1777,9 @@ def _find_direction_for_stops(mr_id: str, from_stop: str, to_stop: str) -> Optio
             for s in race.get("stopList", [])
         ]
         from_i = next(
-            (i for i, n in enumerate(names) if from_stop.lower() in n.lower() or n.lower() in from_stop.lower()),
-            -1,
-        )
-        to_i = next(
-            (i for i, n in enumerate(names) if to_stop.lower() in n.lower() or n.lower() in to_stop.lower()),
-            -1,
-        )
+            -1)
+        from_i = _find_stop_idx(from_stop, names)
+        to_i   = _find_stop_idx(to_stop,   names)
         if from_i != -1 and to_i != -1 and to_i > from_i and names:
             return names[-1]
     return None
@@ -1765,8 +1796,8 @@ def _direction_is_correct(mr_id: str, arr_dir: str, from_stop: str, to_stop: str
         last = names[-1].lower()
         if not (last == ad or ad in last or last in ad):
             continue
-        from_i = next((i for i, n in enumerate(names) if from_stop.lower() in n.lower() or n.lower() in from_stop.lower()), -1)
-        to_i   = next((i for i, n in enumerate(names) if to_stop.lower()   in n.lower() or n.lower() in to_stop.lower()),   -1)
+        from_i = _find_stop_idx(from_stop, names)
+        to_i   = _find_stop_idx(to_stop,   names)
         if from_i != -1 and to_i != -1 and to_i > from_i:
             return True
     return False
@@ -1784,11 +1815,11 @@ def _find_routes_connecting(from_stop: str, to_stop: str) -> list[tuple]:
         route_num = route_by_mr.get(mr_id)
         if not route_num or route_num in seen_routes:
             continue
-        names_lower = [s["name"].lower() for s in stops]
-        from_found  = any(from_stop.lower() in n or n in from_stop.lower() for n in names_lower)
+        stop_names  = [s["name"] for s in stops]
+        from_found  = any(_stop_name_matches(from_stop, sn) for sn in stop_names)
         if not from_found:
             continue
-        to_found = any(to_stop.lower() in n or n in to_stop.lower() for n in names_lower)
+        to_found = any(_stop_name_matches(to_stop, sn) for sn in stop_names)
         if not to_found:
             continue
         terminal = _find_direction_for_stops(mr_id, from_stop, to_stop)
@@ -1813,10 +1844,7 @@ def _vehicle_is_before_stop(mr_id: str, terminal: str, vlat: float, vlng: float,
         if not (last == terminal or terminal.lower() in last.lower() or last.lower() in terminal.lower()):
             continue
 
-        from_i = next(
-            (i for i, n in enumerate(names) if from_stop.lower() in n.lower() or n.lower() in from_stop.lower()),
-            -1,
-        )
+        from_i = _find_stop_idx(from_stop, names)
         if from_i == -1:
             return True
 
@@ -1893,7 +1921,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
     if not from_lat:
         for _stops in stops_cache.values():
             for _s in _stops:
-                if from_stop.lower() in _s["name"].lower() or _s["name"].lower() in from_stop.lower():
+                if _stop_name_matches(from_stop, _s["name"]):
                     from_lat, from_lng = _s["lat"], _s["lng"]
                     break
             if from_lat:
