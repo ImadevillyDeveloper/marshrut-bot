@@ -1979,6 +1979,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
     # Сначала ищем st_id в кеше; если нет — запрашиваем через getStopsByName.
     st_id = _get_stop_id(from_stop) or await asyncio.to_thread(fetch_stop_id_by_name, from_stop)
     arrivals: list[dict] = await asyncio.to_thread(fetch_stop_arrivals, st_id) if st_id else []
+    log.info("findbus: from=%r st_id=%s arrivals=%d", from_stop, st_id, len(arrivals))
 
     # Собираем mr_id маршрутов из прогноза, которых ещё нет в кеше
     forecast_mnums = {str(a.get("mr_num", "")).strip().upper() for a in arrivals}
@@ -1992,6 +1993,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
         forecast_mr_ids.add(_mid)
         if _mid not in stops_cache and _mid not in to_load:
             to_load.append(_mid)
+    log.info("findbus: forecast_mnums=%s forecast_mr_ids=%s", forecast_mnums, forecast_mr_ids)
 
     # Загружаем стопы параллельно — все сразу, не последовательно
     if to_load:
@@ -2002,6 +2004,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
     # Ищем только среди маршрутов из прогноза, а не по всему stops_cache
     # (иначе старые записи кеша дают ложные совпадения с чужими маршрутами)
     routes = _find_routes_connecting(from_stop, to_stop, forecast_mr_ids or None)
+    log.info("findbus: routes=%s", [(r[0], r[2]) for r in routes])
     if not routes:
         await edit_fn(
             f"Не нашли прямых маршрутов из «{from_stop}» до «{to_stop}».\n\n"
