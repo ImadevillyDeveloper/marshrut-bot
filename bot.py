@@ -2322,19 +2322,11 @@ async def _handle_findbus_from_text(update: Update, context: ContextTypes.DEFAUL
 
     msg = await update.message.reply_text("⏳ Ищу остановку...")
 
-    # Строгий поиск: запрос должен покрывать ≥40% слов названия остановки.
-    # Это отсекает ложные совпадения вроде «мега» → «Торговый центр МЕГА Магазин Леруа Мерлен»
-    STRICT = 0.4
-    matches = _search_stops_in_cache(stop_query, min_score=STRICT)
+    matches = _search_stops_in_cache(stop_query)
     if not matches:
-        # Строгих совпадений нет — грузим ВСЕ активные маршруты параллельно
         await msg.edit_text("⏳ Загружаю данные об остановках...")
         vehicles = await asyncio.to_thread(fetch_vehicles)
         await _fetch_all_active_stops_async(vehicles)
-        matches = _search_stops_in_cache(stop_query, min_score=STRICT)
-
-    if not matches:
-        # После полной загрузки строгих совпадений нет — пробуем мягкий поиск
         matches = _search_stops_in_cache(stop_query)
 
     if not matches:
