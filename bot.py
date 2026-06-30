@@ -1886,10 +1886,13 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
         near_stp = nearest_stop_name(vlat, vlng, route_stops) or ""
         dist = haversine_m(from_lat, from_lng, vlat, vlng) if (from_lat and from_lng) else float("inf")
         vehicle_list[r_num].append({
-            "u_id": str(v.get("u_id", "")),
-            "term": str(v.get("rl_laststation_title", "") or "").strip(),
+            "u_id":     str(v.get("u_id", "")),
+            "term":     str(v.get("rl_laststation_title", "") or "").strip(),
             "near_stp": near_stp,
-            "dist": dist,
+            "dist":     dist,
+            "vlat":     vlat,
+            "vlng":     vlng,
+            "mr_id":    mr_id,
         })
     for lst in vehicle_list.values():
         lst.sort(key=lambda x: x["dist"])
@@ -1923,18 +1926,23 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
             continue
         seen_arrivals.add(key)
 
-        # Ищем ближайшее незанятое ТС с совпадающим маршрутом и направлением
+        # Ищем ближайшее незанятое ТС с совпадающим маршрутом, направлением,
+        # которое ещё НЕ доехало до начальной остановки пользователя
         uid_v = ""
         near_stp = ""
         for candidate in vehicle_list.get(mr_num, []):
             if candidate["u_id"] in assigned_uids:
                 continue
             t = candidate["term"]
-            if t == arr_dir or arr_dir.lower() in t.lower() or t.lower() in arr_dir.lower():
-                uid_v    = candidate["u_id"]
-                near_stp = candidate["near_stp"]
-                assigned_uids.add(uid_v)
-                break
+            if not (t == arr_dir or arr_dir.lower() in t.lower() or t.lower() in arr_dir.lower()):
+                continue
+            c_mr_id = candidate["mr_id"]
+            if c_mr_id and not _vehicle_is_before_stop(c_mr_id, t, candidate["vlat"], candidate["vlng"], from_stop):
+                continue  # ТС уже проехало from_stop — пропускаем
+            uid_v    = candidate["u_id"]
+            near_stp = candidate["near_stp"]
+            assigned_uids.add(uid_v)
+            break
 
         route_count[mr_num] += 1
         all_entries.append({
