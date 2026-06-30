@@ -2267,7 +2267,12 @@ async def _handle_findbus_from_text(update: Update, context: ContextTypes.DEFAUL
 
     matches = _search_stops_in_cache(stop_query)
     if not matches:
-        # Кеш пустой — идём сразу в API (не грузим 25 маршрутов синхронно)
+        await msg.edit_text("⏳ Загружаю данные об остановках...")
+        vehicles = await asyncio.to_thread(fetch_vehicles)
+        await asyncio.to_thread(_fetch_active_stops, vehicles)
+        matches = _search_stops_in_cache(stop_query)
+
+    if not matches:
         await msg.edit_text("⏳ Ищу через базу остановок...")
         api_stops = await asyncio.to_thread(fetch_stops_by_name_api, stop_query)
         # Фильтруем по fuzzy-матчу, чтобы не предлагать несвязанные варианты
