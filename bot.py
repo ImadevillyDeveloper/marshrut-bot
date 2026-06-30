@@ -1751,11 +1751,10 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
     new_dest_btn = InlineKeyboardButton("✏️ Другая конечная",       callback_data="findbus:askdest")
 
     vehicles = fetch_vehicles()
+    # Всегда подгружаем остановки активных маршрутов в кеш,
+    # чтобы не пропустить маршруты, которые ещё не запрашивались
+    _fetch_active_stops(vehicles)
     routes   = _find_routes_connecting(from_stop, to_stop)
-
-    if not routes:
-        _fetch_active_stops(vehicles)
-        routes = _find_routes_connecting(from_stop, to_stop)
 
     if not routes:
         await edit_fn(
@@ -1786,7 +1785,10 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
                 continue
             if not v.get("u_lat") or not v.get("u_long"):
                 continue
-            if str(v.get("rl_laststation_title", "") or "").strip() != terminal:
+            v_terminal = str(v.get("rl_laststation_title", "") or "").strip()
+            if not (v_terminal == terminal
+                    or terminal.lower() in v_terminal.lower()
+                    or v_terminal.lower() in terminal.lower()):
                 continue
             vlat = float(v["u_lat"])
             vlng = float(v["u_long"])
