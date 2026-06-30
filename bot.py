@@ -1954,7 +1954,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
     retry_btn    = InlineKeyboardButton("🔄 Обновить",              callback_data="findbus:refresh")
     new_dest_btn = InlineKeyboardButton("✏️ Другая конечная",       callback_data="findbus:askdest")
 
-    vehicles = fetch_vehicles()
+    vehicles = await asyncio.to_thread(fetch_vehicles)
     # Обновляем mr_id_cache для всех активных ТС — без HTTP-запросов
     for _v in vehicles:
         _rn  = str(_v.get("mr_num", "")).strip().upper()
@@ -2266,13 +2266,7 @@ async def _handle_findbus_from_text(update: Update, context: ContextTypes.DEFAUL
 
     matches = _search_stops_in_cache(stop_query)
     if not matches:
-        await msg.edit_text("⏳ Загружаю данные об остановках...")
-        vehicles = fetch_vehicles()
-        _fetch_active_stops(vehicles)
-        matches = _search_stops_in_cache(stop_query)
-
-    if not matches:
-        # Кеш не помог — спрашиваем API напрямую
+        # Кеш пустой — идём сразу в API (не грузим 25 маршрутов синхронно)
         await msg.edit_text("⏳ Ищу через базу остановок...")
         api_stops = await asyncio.to_thread(fetch_stops_by_name_api, stop_query)
         # Фильтруем по fuzzy-матчу, чтобы не предлагать несвязанные варианты
