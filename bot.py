@@ -2693,16 +2693,18 @@ async def _warmup_stops_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("Warmup: готово, индекс остановок: %d остановок", len(all_stops_index))
 
 
-async def _broadcast_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    BROADCAST_ID = "demo_v1"
-    conn = sqlite3.connect(DB_PATH)
-    already_sent = conn.execute(
-        "SELECT 1 FROM sent_broadcasts WHERE broadcast_id = ?", (BROADCAST_ID,)
-    ).fetchone()
-    if already_sent:
-        conn.close()
+ADMIN_ID = 684779015
+
+
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID:
+        return
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text("Использование: /broadcast <текст сообщения>")
         return
 
+    conn = sqlite3.connect(DB_PATH)
     rows = conn.execute("""
         SELECT user_id FROM users
         UNION
@@ -2714,21 +2716,10 @@ async def _broadcast_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     user_ids = [r[0] for r in rows]
     if not user_ids:
+        await update.message.reply_text("Нет пользователей для рассылки.")
         return
 
-    text = (
-        "🚌 <b>В боте появился новый функционал — «Мой маршрут»!</b>\n\n"
-        "Теперь вы можете указать начальную и конечную остановку, "
-        "и бот подберёт автобусы, которые едут именно по вашему маршруту — "
-        "с временем прибытия и номером ТС.\n\n"
-        "Это стабильная демо-версия. Попробовать можно через кнопку "
-        "<b>МОЙ МАРШРУТ</b> в главном меню.\n\n"
-        "⚠️ Рекомендуем тестировать не раньше завтрашнего утра — "
-        "тогда на линии будет наибольшее количество транспортных средств "
-        "и функция отработает в полную силу.\n\n"
-        "Есть предложения по улучшению? Пишите: @sprint_err"
-    )
-
+    await update.message.reply_text(f"Начинаю рассылку для {len(user_ids)} пользователей...")
     ok = fail = 0
     for uid in user_ids:
         try:
@@ -2737,11 +2728,7 @@ async def _broadcast_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             fail += 1
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT OR IGNORE INTO sent_broadcasts (broadcast_id) VALUES (?)", (BROADCAST_ID,))
-    conn.commit()
-    conn.close()
-    log.info("Рассылка demo_v1: отправлено %d, ошибок %d", ok, fail)
+    await update.message.reply_text(f"Готово. Отправлено: {ok}, ошибок: {fail}.")
 
 
 # ── Запуск ─────────────────────────────────────────────────────────
@@ -2775,8 +2762,9 @@ def main() -> None:
     _start_health_server()
     app = Application.builder().token(token).post_init(post_init).build()
 
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("help",   cmd_help))
+    app.add_handler(CommandHandler("start",     cmd_start))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("track",  cmd_track))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("stop",   cmd_stop))
@@ -2808,7 +2796,6 @@ def main() -> None:
 
     app.job_queue.run_repeating(poll_job, interval=POLL_INTERVAL, first=15)
     app.job_queue.run_once(_warmup_stops_job, when=10)
-    app.job_queue.run_once(_broadcast_job, when=20)
 
     log.info("Бот запущен. Интервал опроса: %d сек.", POLL_INTERVAL)
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
