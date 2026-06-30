@@ -1994,12 +1994,13 @@ def _find_routes_connecting(
     from_stop: str,
     to_stop: str,
     allowed_mr_ids: Optional[set] = None,
+    from_stop_st_id: Optional[str] = None,
 ) -> list[tuple]:
     """
     Возвращает [(route_num, mr_id, terminal), ...] — маршруты, по которым можно
     доехать от from_stop до to_stop напрямую (to_stop стоит после from_stop в рейсе).
-    allowed_mr_ids — если задано, проверяются только маршруты из этого множества
-    (используется чтобы не выдавать маршруты из старого кеша, не связанного с запросом).
+    allowed_mr_ids — если задано, проверяются только маршруты из этого множества.
+    from_stop_st_id — если задано, проверяет вхождение по st_id (точнее fuzzy имени).
     """
     route_by_mr = {v: k for k, v in mr_id_cache.items()}
     results: list[tuple] = []
@@ -2010,11 +2011,13 @@ def _find_routes_connecting(
         route_num = route_by_mr.get(mr_id)
         if not route_num or route_num in seen_routes:
             continue
-        stop_names  = [s["name"] for s in stops]
-        from_found  = any(_stop_name_matches(from_stop, sn) for sn in stop_names)
+        if from_stop_st_id:
+            from_found = any(s.get("st_id") == from_stop_st_id for s in stops)
+        else:
+            from_found = any(_stop_name_matches(from_stop, s["name"]) for s in stops)
         if not from_found:
             continue
-        to_found = any(_stop_name_matches(to_stop, sn) for sn in stop_names)
+        to_found = any(_stop_name_matches(to_stop, s["name"]) for s in stops)
         if not to_found:
             continue
         terminal = _find_direction_for_stops(mr_id, from_stop, to_stop)
@@ -2155,7 +2158,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
 
     # Ищем только среди маршрутов из прогноза, а не по всему stops_cache
     # (иначе старые записи кеша дают ложные совпадения с чужими маршрутами)
-    routes = _find_routes_connecting(from_stop, to_stop, forecast_mr_ids or None)
+    routes = _find_routes_connecting(from_stop, to_stop, forecast_mr_ids or None, from_stop_st_id=st_id or None)
     log.info("findbus: routes=%s", [(r[0], r[2]) for r in routes])
     if not routes:
         await edit_fn(
@@ -2194,6 +2197,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
             "vlat":     vlat,
             "vlng":     vlng,
             "mr_id":    mr_id,
+            "plate":    str(v.get("u_statenum", "") or "").strip(),
         })
     for lst in vehicle_list.values():
         lst.sort(key=lambda x: x["dist"])
@@ -2231,6 +2235,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
         # которое ещё НЕ доехало до начальной остановки пользователя
         uid_v = ""
         near_stp = ""
+        plate = ""
         for candidate in vehicle_list.get(mr_num, []):
             if candidate["u_id"] in assigned_uids:
                 continue
@@ -2242,6 +2247,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
                 continue  # ТС уже проехало from_stop — пропускаем
             uid_v    = candidate["u_id"]
             near_stp = candidate["near_stp"]
+            plate    = candidate.get("plate", "")
             assigned_uids.add(uid_v)
             break
 
@@ -2251,6 +2257,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
             "arr_time":  arr_time,
             "near_stp":  near_stp,
             "uid_v":     uid_v,
+            "plate":     plate,
         })
 
     if not all_entries:
@@ -2275,6 +2282,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
                     "near_stp":  near_stp,
                     "uid_v":     str(v.get("u_id", "")),
                     "dist_m":    dist_m,
+                    "plate":     str(v.get("u_statenum", "") or "").strip(),
                 })
         all_entries_fallback.sort(key=lambda x: x["dist_m"])
         all_entries = all_entries_fallback[:5]
@@ -2288,16 +2296,18 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
 
     vehicle_btns: list[list[InlineKeyboardButton]] = []
     for e in all_entries[:5]:
-        near = e.get("near_stp") or ""
+        near  = e.get("near_stp") or ""
+        plate = e.get("plate") or ""
+        plate_part = f"  {plate}" if plate else ""
         if e.get("arr_time"):
             loc_part  = f"  📍 {near}" if near else ""
             time_part = f"  ⏱ {e['arr_time']}"
-            label = f"🚌 {e['route_num']}{loc_part}{time_part}"
+            label = f"🚌 {e['route_num']}{plate_part}{loc_part}{time_part}"
         else:
             dist = e.get("dist_m", float("inf"))
             dist_str = f"{int(dist)} м" if dist < 1000 else f"{dist / 1000:.1f} км"
             loc_part = f"  📍 {near}" if near else ""
-            label = f"🚌 {e['route_num']}{loc_part}  ({dist_str})"
+            label = f"🚌 {e['route_num']}{plate_part}{loc_part}  ({dist_str})"
         cb = f"findbus_where:{e['uid_v']}:{e['route_num']}" if e["uid_v"] else "findbus:refresh"
         vehicle_btns.append([InlineKeyboardButton(label, callback_data=cb)])
 
