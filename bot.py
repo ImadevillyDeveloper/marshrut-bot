@@ -1951,9 +1951,10 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) -> None:
     """Находит маршруты A→B и показывает до 5 ТС, отсортированных по близости."""
-    home_btn     = InlineKeyboardButton("🏠 Главное меню",          callback_data="menu:back")
-    retry_btn    = InlineKeyboardButton("🔄 Обновить",              callback_data="findbus:refresh")
-    new_dest_btn = InlineKeyboardButton("✏️ Другая конечная",       callback_data="findbus:askdest")
+    home_btn      = InlineKeyboardButton("🏠 Главное меню",          callback_data="menu:back")
+    retry_btn     = InlineKeyboardButton("🔄 Обновить",              callback_data="findbus:refresh")
+    new_dest_btn  = InlineKeyboardButton("✏️ Другая конечная",       callback_data="findbus:askdest")
+    new_from_btn  = InlineKeyboardButton("📍 Другая начальная",      callback_data="findbus:manual")
 
     vehicles = await asyncio.to_thread(fetch_vehicles)
     # Обновляем mr_id_cache для всех активных ТС — без HTTP-запросов
@@ -2008,8 +2009,8 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
     if not routes:
         await edit_fn(
             f"Не нашли прямых маршрутов из «{from_stop}» до «{to_stop}».\n\n"
-            "Возможно, нужна пересадка или попробуй другое название конечной остановки.",
-            reply_markup=InlineKeyboardMarkup([[new_dest_btn], [home_btn]]),
+            "Возможно, нужна пересадка, другое название конечной или начальной остановки.",
+            reply_markup=InlineKeyboardMarkup([[new_dest_btn, new_from_btn], [home_btn]]),
         )
         return
 
@@ -2150,7 +2151,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
         vehicle_btns.append([InlineKeyboardButton(label, callback_data=cb)])
 
     vehicle_btns.append([retry_btn, new_dest_btn])
-    vehicle_btns.append([home_btn])
+    vehicle_btns.append([new_from_btn, home_btn])
 
     await edit_fn(
         f"🚏 <b>{from_display}</b> → <b>{to_display}</b>\n\nПрибытие на вашу остановку:",
@@ -2302,11 +2303,12 @@ async def _handle_findbus_from_text(update: Update, context: ContextTypes.DEFAUL
     if len(unique_names) == 1:
         context.user_data["findbus_from_stop"]    = unique_names[0]
         context.user_data["findbus_waiting_dest"] = True
+        other_btn = InlineKeyboardButton("✏️ Другая остановка", callback_data="findbus:manual")
         await msg.edit_text(
             f"📍 Остановка: <b>{unique_names[0]}</b>\n\n"
             "Куда едешь? Введи название конечной остановки:",
             parse_mode=H,
-            reply_markup=InlineKeyboardMarkup([[home_btn]]),
+            reply_markup=InlineKeyboardMarkup([[other_btn], [home_btn]]),
         )
     else:
         context.user_data["findbus_from_opts"] = unique_names[:4]
