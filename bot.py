@@ -1625,7 +1625,9 @@ def _nearest_stop_from_cache(lat: float, lng: float) -> Optional[tuple]:
 
 
 def _fetch_active_stops(vehicles: list[dict], max_routes: int = 25) -> None:
-    """Загружает остановки для активных маршрутов, которых ещё нет в кеше."""
+    """Загружает остановки для активных маршрутов, которых ещё нет в кеше.
+    mr_id_cache обновляется для ВСЕХ маршрутов из vehicles (без лимита).
+    Стоп-листы загружаются для первых max_routes новых маршрутов."""
     count = 0
     seen: set[str] = set()
     for v in vehicles:
@@ -1634,12 +1636,11 @@ def _fetch_active_stops(vehicles: list[dict], max_routes: int = 25) -> None:
         if not mr_num or not mr_id or mr_num in seen:
             continue
         seen.add(mr_num)
-        mr_id_cache[mr_num] = mr_id
+        mr_id_cache[mr_num] = mr_id  # всегда обновляем, даже если stops не грузим
         if mr_id not in stops_cache:
-            stops_cache[mr_id] = fetch_route_stops(mr_id)
-            count += 1
-            if count >= max_routes:
-                break
+            if count < max_routes:
+                stops_cache[mr_id] = fetch_route_stops(mr_id)
+                count += 1
 
 
 def _search_stops_in_cache(query_str: str) -> list[tuple]:
@@ -1820,22 +1821,8 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
     new_dest_btn = InlineKeyboardButton("✏️ Другая конечная",       callback_data="findbus:askdest")
 
     vehicles = fetch_vehicles()
-    # Подгружаем остановки активных маршрутов в кеш чтобы иметь st_id и маршруты
+    # Грузим остановки активных маршрутов; mr_id_cache обновляется для всех без лимита
     _fetch_active_stops(vehicles)
-
-    # Определяем какие маршруты везут from_stop → to_stop и их конечные
-    routes = _find_routes_connecting(from_stop, to_stop)
-    if not routes:
-        await edit_fn(
-            f"Не нашли прямых маршрутов из «{from_stop}» до «{to_stop}».\n\n"
-            "Возможно, нужна пересадка или попробуй другое название конечной остановки.",
-            reply_markup=InlineKeyboardMarkup([[new_dest_btn], [home_btn]]),
-        )
-        return
-
-    # Канонические названия остановок (как на сайте, не как ввёл пользователь)
-    from_display = _canonical_stop_name(from_stop)
-    to_display   = _canonical_stop_name(to_stop)
 
     from_lat = context.user_data.get("findbus_from_lat")
     from_lng = context.user_data.get("findbus_from_lng")
@@ -1853,6 +1840,32 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
     # getStopArrive возвращает только ТС, которые ещё не проехали остановку — условие "не доехал" выполнено.
     st_id = _get_stop_id(from_stop)
     arrivals: list[dict] = fetch_stop_arrivals(st_id) if st_id else []
+
+    # Целенаправленно грузим стоп-листы для маршрутов из прогноза, которых ещё нет в кеше.
+    # _fetch_active_stops мог их пропустить из-за лимита 25 маршрутов.
+    if arrivals:
+        forecast_mnums = {str(a.get("mr_num", "")).strip().upper() for a in arrivals}
+        for v in vehicles:
+            rn  = str(v.get("mr_num", "")).strip().upper()
+            mid = str(v.get("mr_id",  "")).strip()
+            if rn not in forecast_mnums or not mid:
+                continue
+            mr_id_cache[rn] = mid
+            if mid not in stops_cache:
+                stops_cache[mid] = fetch_route_stops(mid)
+
+    # После дозагрузки — перепроверяем маршруты
+    routes = _find_routes_connecting(from_stop, to_stop)
+    if not routes:
+        await edit_fn(
+            f"Не нашли прямых маршрутов из «{from_stop}» до «{to_stop}».\n\n"
+            "Возможно, нужна пересадка или попробуй другое название конечной остановки.",
+            reply_markup=InlineKeyboardMarkup([[new_dest_btn], [home_btn]]),
+        )
+        return
+
+    from_display = _canonical_stop_name(from_stop)
+    to_display   = _canonical_stop_name(to_stop)
 
     # mr_id для маршрутов, которые прошли проверку _find_routes_connecting — самый надёжный источник
     mr_id_by_route: dict[str, str] = {rn: mid for rn, mid, _ in routes}
