@@ -23,7 +23,10 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 DB_PATH = os.path.join(os.path.dirname(__file__), "marshrut.db")
 
 import requests as http
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand,
+    KeyboardButton, ReplyKeyboardMarkup as RKMarkup, ReplyKeyboardRemove,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -575,6 +578,7 @@ def _main_menu_markup() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🔔 Мои подписки", callback_data="menu:status"),
             InlineKeyboardButton("💳 Мои карты",    callback_data="menu:cards"),
         ],
+        [InlineKeyboardButton("📍 Найти маршрут", callback_data="geo:start")],
         [InlineKeyboardButton("❓ Справка", callback_data="menu:help")],
     ])
 
@@ -685,6 +689,11 @@ async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data.get("geo_waiting_dest"):
+        context.user_data.pop("geo_waiting_dest")
+        await _geo_handle_destination(update, context)
+        return
+
     route = (update.message.text or "").strip().upper()
     if not route:
         return
@@ -1523,6 +1532,454 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     log.warning("send_message uid=%s: %s", uid, e)
 
 
+# ── Геолокация ─────────────────────────────────────────────────────
+
+def _fetch_stops_near(lat: float, lng: float, vehicles: list[dict], radius_m: float = 4000) -> None:
+    """Загружает остановки для маршрутов с активными ТС в радиусе radius_m от точки."""
+    for v in vehicles:
+        vlat = float(v.get("u_lat", 0) or 0)
+        vlng = float(v.get("u_long", 0) or 0)
+        if not vlat or not vlng:
+            continue
+        if haversine_m(lat, lng, vlat, vlng) <= radius_m:
+            mr_num = str(v.get("mr_num", "")).strip().upper()
+            mr_id  = str(v.get("mr_id",  "")).strip()
+            if mr_num and mr_id:
+                mr_id_cache[mr_num] = mr_id
+                if mr_id not in stops_cache:
+                    stops_cache[mr_id] = fetch_route_stops(mr_id)
+
+
+def _nearest_stop_from_cache(lat: float, lng: float) -> Optional[tuple]:
+    """Возвращает (название, lat, lng, расстояние_м) ближайшей кешированной остановки."""
+    best = None
+    best_d = float("inf")
+    for stops in stops_cache.values():
+        for s in stops:
+            d = haversine_m(lat, lng, s["lat"], s["lng"])
+            if d < best_d:
+                best_d = d
+                best = (s["name"], s["lat"], s["lng"], d)
+    return best
+
+
+def _routes_near_stop(stop_lat: float, stop_lng: float, radius_m: float = 400) -> list[str]:
+    """Маршруты, у которых есть остановка в радиусе radius_m от указанных координат."""
+    route_by_mr = {v: k for k, v in mr_id_cache.items()}
+    routes: list[str] = []
+    seen: set[str] = set()
+    for mr_id, stops in stops_cache.items():
+        for s in stops:
+            if haversine_m(stop_lat, stop_lng, s["lat"], s["lng"]) <= radius_m:
+                rn = route_by_mr.get(mr_id)
+                if rn and rn not in seen:
+                    seen.add(rn)
+                    routes.append(rn)
+                break
+    return sorted(routes, key=lambda x: (len(x), x))
+
+
+def _find_nearest_vehicle_to(
+    lat: float, lng: float, route: str, terminal: Optional[str], vehicles: list[dict]
+) -> Optional[dict]:
+    """Ближайшее к точке активное ТС на маршруте route (с фильтром по terminal, если задан)."""
+    candidates = [
+        v for v in vehicles
+        if str(v.get("mr_num", "")).strip().upper() == route
+        and v.get("u_lat") and v.get("u_long")
+        and (terminal is None or str(v.get("rl_laststation_title", "") or "").strip() == terminal)
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda v: haversine_m(lat, lng, float(v["u_lat"]), float(v["u_long"])))
+
+
+def _find_direction_for_stops(mr_id: str, from_stop: str, to_stop: str) -> Optional[str]:
+    """
+    Возвращает терминал рейса, в котором from_stop стоит перед to_stop.
+    Терминал = последняя остановка рейса (совпадает с rl_laststation_title).
+    """
+    try:
+        data  = _rpc("getRoute", {"mr_id": mr_id})
+        races = data.get("result", {}).get("races", [])
+        for race in races:
+            names = [
+                (s.get("st_title") or s.get("st_name") or "").strip()
+                for s in race.get("stopList", [])
+            ]
+            from_i = next(
+                (i for i, n in enumerate(names) if from_stop.lower() in n.lower() or n.lower() in from_stop.lower()),
+                -1,
+            )
+            to_i = next(
+                (i for i, n in enumerate(names) if to_stop.lower() in n.lower() or n.lower() in to_stop.lower()),
+                -1,
+            )
+            if from_i != -1 and to_i != -1 and to_i > from_i and names:
+                return names[-1]
+    except Exception as e:
+        log.warning("_find_direction_for_stops mr_id=%s: %s", mr_id, e)
+    return None
+
+
+def _search_stops_in_cache(query_str: str) -> list[tuple]:
+    """Ищет остановки по подстроке во всех кешированных маршрутах. Возвращает [(stop_name, mr_id), ...]."""
+    q = query_str.lower().strip()
+    results: list[tuple] = []
+    seen: set = set()
+    for mr_id, stops in stops_cache.items():
+        for s in stops:
+            name = s["name"]
+            if q in name.lower() or name.lower() in q:
+                key = (name, mr_id)
+                if key not in seen:
+                    seen.add(key)
+                    results.append((name, mr_id))
+    return results
+
+
+async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Пользователь отправил геолокацию — определяем ближайшую остановку."""
+    loc = update.message.location
+    lat, lng = loc.latitude, loc.longitude
+
+    msg = await update.message.reply_text(
+        "⏳ Определяю ближайшую остановку...",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+    vehicles = fetch_vehicles()
+    _fetch_stops_near(lat, lng, vehicles)
+
+    result = _nearest_stop_from_cache(lat, lng)
+    if not result:
+        await msg.edit_text(
+            "Не удалось определить остановку: нет данных об остановках рядом.\n\n"
+            "Попробуй отправить геолокацию ещё раз.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Главное меню", callback_data="menu:back")
+            ]]),
+        )
+        return
+
+    stop_name, stop_lat, stop_lng, dist_m = result
+    context.user_data["geo_lat"]      = lat
+    context.user_data["geo_lng"]      = lng
+    context.user_data["geo_stop"]     = stop_name
+    context.user_data["geo_stop_lat"] = stop_lat
+    context.user_data["geo_stop_lng"] = stop_lng
+
+    dist_str = f"{int(dist_m)} м" if dist_m < 1000 else f"{dist_m / 1000:.1f} км"
+    await msg.edit_text(
+        f"📍 Похоже, вы у остановки:\n\n"
+        f"<b>{stop_name}</b>\n"
+        f"(~{dist_str} от вас)\n\n"
+        "Верно?",
+        parse_mode=H,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Да, верно", callback_data="geo:confirm"),
+                InlineKeyboardButton("❌ Нет", callback_data="geo:retry"),
+            ],
+        ]),
+    )
+
+
+async def _show_geo_vehicle(
+    query, context, route: str, v: Optional[dict], lat: float, lng: float, terminal: Optional[str] = None
+) -> None:
+    """Показывает карточку ближайшего к пользователю автобуса."""
+    home_btn = InlineKeyboardButton("🏠 Главное меню", callback_data="menu:back")
+    context.user_data["geo_route"]    = route
+    context.user_data["geo_terminal"] = terminal
+
+    if not v:
+        await query.edit_message_text(
+            f"Маршрут <b>{route}</b>"
+            + (f" → <b>{terminal}</b>" if terminal else "")
+            + "\n\nСейчас нет ТС в этом направлении.",
+            parse_mode=H,
+            reply_markup=InlineKeyboardMarkup([[home_btn]]),
+        )
+        return
+
+    vlat  = float(v.get("u_lat",  0) or 0)
+    vlng  = float(v.get("u_long", 0) or 0)
+    plate = str(v.get("u_statenum", "") or "").strip() or "б/н"
+    speed = int(float(v.get("u_speed", 0) or 0))
+    dist_m   = haversine_m(lat, lng, vlat, vlng)
+    dist_str = f"{int(dist_m)} м" if dist_m < 1000 else f"{dist_m / 1000:.1f} км"
+
+    mr_id = mr_id_cache.get(route)
+    stop_name = "нет данных"
+    if mr_id and mr_id in stops_cache:
+        sn = nearest_stop_name(vlat, vlng, stops_cache[mr_id])
+        if sn:
+            stop_name = sn
+
+    await query.edit_message_text(
+        f"🚌 Маршрут <b>{route}</b>"
+        + (f" → <b>{terminal}</b>" if terminal else "")
+        + "\n\nБлижайший к вам автобус:\n"
+        f"🚗 Госномер: <b>{plate}</b>\n"
+        f"📍 Сейчас у: <b>{stop_name}</b>\n"
+        f"⚡ Скорость: <b>{speed} км/ч</b>\n"
+        f"📏 До вас: <b>{dist_str}</b>",
+        parse_mode=H,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Обновить", callback_data="geo:refresh")],
+            [home_btn],
+        ]),
+    )
+
+
+async def on_geo_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    parts  = query.data.split(":", 2)
+    action = parts[1]
+
+    lat      = context.user_data.get("geo_lat",      0.0)
+    lng      = context.user_data.get("geo_lng",      0.0)
+    stop     = context.user_data.get("geo_stop",     "")
+    stop_lat = context.user_data.get("geo_stop_lat", 0.0)
+    stop_lng = context.user_data.get("geo_stop_lng", 0.0)
+    home_btn = InlineKeyboardButton("🏠 Главное меню", callback_data="menu:back")
+
+    if action == "start":
+        rk = RKMarkup(
+            [[KeyboardButton("📍 Отправить геолокацию", request_location=True)]],
+            one_time_keyboard=True,
+            resize_keyboard=True,
+        )
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=(
+                "📍 <b>Поиск маршрута по геолокации</b>\n\n"
+                "Нажми кнопку ниже, чтобы отправить своё местоположение. "
+                "Я найду ближайшую остановку и подберу маршруты."
+            ),
+            parse_mode=H,
+            reply_markup=rk,
+        )
+
+    elif action == "confirm":
+        await query.edit_message_text(
+            f"📍 Остановка: <b>{stop}</b>\n\nЧто хочешь найти?",
+            parse_mode=H,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚌 Выбрать маршрут", callback_data="geo:mode:route")],
+                [InlineKeyboardButton("📍 Ввести конечную остановку", callback_data="geo:mode:dest")],
+                [home_btn],
+            ]),
+        )
+
+    elif action == "retry":
+        rk = RKMarkup(
+            [[KeyboardButton("📍 Отправить геолокацию снова", request_location=True)]],
+            one_time_keyboard=True,
+            resize_keyboard=True,
+        )
+        await query.edit_message_text(
+            "Хорошо, попробуй отправить геолокацию ещё раз.",
+            reply_markup=InlineKeyboardMarkup([[home_btn]]),
+        )
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="📍 Нажми кнопку ниже:",
+            reply_markup=rk,
+        )
+
+    elif action == "mode":
+        mode = parts[2] if len(parts) > 2 else ""
+
+        if mode == "route":
+            routes = _routes_near_stop(stop_lat, stop_lng, radius_m=400)
+            if not routes:
+                vehicles = fetch_vehicles()
+                routes = sorted(
+                    {str(v.get("mr_num", "")).strip().upper() for v in vehicles if v.get("mr_num")},
+                    key=lambda x: (len(x), x),
+                )
+            if not routes:
+                await query.edit_message_text(
+                    "Нет активных маршрутов. Попробуй позже.",
+                    reply_markup=InlineKeyboardMarkup([[home_btn]]),
+                )
+                return
+            buttons = [
+                [InlineKeyboardButton(r, callback_data=f"geo:route:{r}")]
+                for r in routes[:24]
+            ]
+            buttons.append([home_btn])
+            await query.edit_message_text(
+                f"📍 Остановка: <b>{stop}</b>\n\nВыбери маршрут:",
+                parse_mode=H,
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+
+        elif mode == "dest":
+            context.user_data["geo_waiting_dest"] = True
+            await query.edit_message_text(
+                f"📍 Остановка: <b>{stop}</b>\n\n"
+                "Введи название конечной остановки (или часть названия):",
+                parse_mode=H,
+                reply_markup=InlineKeyboardMarkup([[home_btn]]),
+            )
+
+    elif action == "route":
+        route = parts[2] if len(parts) > 2 else ""
+        context.user_data["geo_route"] = route
+
+        vehicles = fetch_vehicles()
+        route_vehicles = [
+            v for v in vehicles
+            if str(v.get("mr_num", "")).strip().upper() == route
+        ]
+
+        for v in route_vehicles:
+            mr_id = str(v.get("mr_id", "")).strip()
+            if mr_id:
+                mr_id_cache[route] = mr_id
+                break
+        mr_id = mr_id_cache.get(route)
+        if mr_id and mr_id not in stops_cache:
+            stops_cache[mr_id] = fetch_route_stops(mr_id)
+
+        if not route_vehicles:
+            await query.edit_message_text(
+                f"Маршрут <b>{route}</b>: сейчас нет ТС на линии.",
+                parse_mode=H,
+                reply_markup=InlineKeyboardMarkup([[home_btn]]),
+            )
+            return
+
+        terminals: list[str] = []
+        seen_t: set[str] = set()
+        for v in route_vehicles:
+            t = str(v.get("rl_laststation_title", "") or "").strip()
+            if t and t not in seen_t:
+                terminals.append(t)
+                seen_t.add(t)
+        context.user_data["geo_terminals"] = terminals
+
+        if len(terminals) <= 1:
+            terminal = terminals[0] if terminals else None
+            v_best = _find_nearest_vehicle_to(lat, lng, route, terminal, vehicles)
+            await _show_geo_vehicle(query, context, route, v_best, lat, lng, terminal)
+            return
+
+        buttons = [
+            [InlineKeyboardButton(f"→ {t}", callback_data=f"geo:dir:{i}")]
+            for i, t in enumerate(terminals)
+        ]
+        buttons.append([home_btn])
+        await query.edit_message_text(
+            f"Маршрут <b>{route}</b>. В каком направлении?",
+            parse_mode=H,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif action == "dir":
+        idx       = int(parts[2]) if len(parts) > 2 else 0
+        route     = context.user_data.get("geo_route", "")
+        terminals = context.user_data.get("geo_terminals", [])
+        terminal  = terminals[idx] if idx < len(terminals) else None
+        vehicles  = fetch_vehicles()
+        v_best    = _find_nearest_vehicle_to(lat, lng, route, terminal, vehicles)
+        await _show_geo_vehicle(query, context, route, v_best, lat, lng, terminal)
+
+    elif action == "refresh":
+        route    = context.user_data.get("geo_route", "")
+        terminal = context.user_data.get("geo_terminal")
+        vehicles = fetch_vehicles()
+        v_best   = _find_nearest_vehicle_to(lat, lng, route, terminal, vehicles)
+        await _show_geo_vehicle(query, context, route, v_best, lat, lng, terminal)
+
+
+async def _geo_handle_destination(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает текстовый ввод конечной остановки."""
+    dest_text = (update.message.text or "").strip()
+    lat      = context.user_data.get("geo_lat",  0.0)
+    lng      = context.user_data.get("geo_lng",  0.0)
+    stop     = context.user_data.get("geo_stop", "")
+    home_btn = InlineKeyboardButton("🏠 Главное меню", callback_data="menu:back")
+
+    msg = await update.message.reply_text("⏳ Ищу подходящие маршруты...")
+
+    matches = _search_stops_in_cache(dest_text)
+    if not matches:
+        await msg.edit_text(
+            f"Не нашли остановку «{dest_text}» среди загруженных маршрутов.\n\n"
+            "Поиск работает по маршрутам, которые сейчас активны. "
+            "Попробуй другое название или выбери режим «Выбрать маршрут».",
+            reply_markup=InlineKeyboardMarkup([[home_btn]]),
+        )
+        return
+
+    vehicles    = fetch_vehicles()
+    route_by_mr = {v: k for k, v in mr_id_cache.items()}
+
+    results: list[tuple] = []
+    seen_routes: set[str] = set()
+
+    for dest_stop_name, mr_id in matches[:10]:
+        route_num = route_by_mr.get(mr_id)
+        if not route_num or route_num in seen_routes:
+            continue
+        seen_routes.add(route_num)
+
+        terminal = _find_direction_for_stops(mr_id, stop, dest_stop_name)
+        v_best   = _find_nearest_vehicle_to(lat, lng, route_num, terminal, vehicles)
+        if not v_best:
+            v_best = _find_nearest_vehicle_to(lat, lng, route_num, None, vehicles)
+        if not v_best:
+            continue
+
+        vlat  = float(v_best.get("u_lat", 0) or 0)
+        vlng  = float(v_best.get("u_long", 0) or 0)
+        dist_m = haversine_m(lat, lng, vlat, vlng)
+        results.append((route_num, dest_stop_name, terminal, v_best, dist_m))
+
+    if not results:
+        await msg.edit_text(
+            f"Нашли остановку «{dest_text}», но сейчас нет активных ТС на подходящих маршрутах.",
+            reply_markup=InlineKeyboardMarkup([[home_btn]]),
+        )
+        return
+
+    results.sort(key=lambda x: x[4])
+    lines = []
+    for route_num, dest_stop, terminal, v, dist_m in results[:5]:
+        plate    = str(v.get("u_statenum", "") or "").strip() or "б/н"
+        speed    = int(float(v.get("u_speed", 0) or 0))
+        dist_str = f"{int(dist_m)} м" if dist_m < 1000 else f"{dist_m / 1000:.1f} км"
+
+        vlat2  = float(v.get("u_lat", 0) or 0)
+        vlng2  = float(v.get("u_long", 0) or 0)
+        mr_id2 = mr_id_cache.get(route_num)
+        near_stop = "нет данных"
+        if mr_id2 and mr_id2 in stops_cache:
+            sn = nearest_stop_name(vlat2, vlng2, stops_cache[mr_id2])
+            if sn:
+                near_stop = sn
+
+        term_str = f" → {terminal}" if terminal else ""
+        lines.append(
+            f"🚌 <b>{route_num}</b>{term_str}\n"
+            f"   🚗 {plate}  ⚡ {speed} км/ч\n"
+            f"   📍 Сейчас у: {near_stop}\n"
+            f"   📏 До вас: <b>{dist_str}</b>"
+        )
+
+    await msg.edit_text(
+        f"📍 <b>{stop}</b> → <b>{dest_text}</b>\n\n" + "\n\n".join(lines),
+        parse_mode=H,
+        reply_markup=InlineKeyboardMarkup([[home_btn]]),
+    )
+
+
 # ── Health-check сервер (для Render / UptimeRobot) ─────────────────
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -1598,11 +2055,13 @@ def main() -> None:
         },
         fallbacks=[CommandHandler("cancel", addcard_cancel)],
     ))
+    app.add_handler(MessageHandler(filters.LOCATION, on_location))
     app.add_handler(CallbackQueryHandler(on_menu_action,    pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(on_card_action,    pattern=r"^card:"))
     app.add_handler(CallbackQueryHandler(on_route_action,  pattern=r"^route:"))
     app.add_handler(CallbackQueryHandler(on_filter_action, pattern=r"^filter:"))
     app.add_handler(CallbackQueryHandler(on_where_vehicle, pattern=r"^where:"))
+    app.add_handler(CallbackQueryHandler(on_geo_action,    pattern=r"^geo:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     app.job_queue.run_repeating(poll_job, interval=POLL_INTERVAL, first=15)
