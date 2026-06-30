@@ -783,11 +783,11 @@ H = "HTML"  # parse_mode shortcut
 
 def _main_menu_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚌 МОЙ МАРШРУТ", callback_data="findbus:start")],
         [
-            InlineKeyboardButton("🔔 Мои подписки", callback_data="menu:status"),
             InlineKeyboardButton("💳 Мои карты",    callback_data="menu:cards"),
+            InlineKeyboardButton("🔔 Мои подписки", callback_data="menu:status"),
         ],
-        [InlineKeyboardButton("🚌 Найти транспорт", callback_data="findbus:start")],
         [InlineKeyboardButton("❓ Справка",          callback_data="menu:help")],
     ])
 
