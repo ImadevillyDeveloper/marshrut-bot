@@ -715,16 +715,27 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-def _vehicle_buttons(route: str, route_vehicles: list[dict]) -> list[list[InlineKeyboardButton]]:
+def _vehicle_buttons(
+    route: str,
+    route_vehicles: list[dict],
+    stops: Optional[list[dict]] = None,
+) -> list[list[InlineKeyboardButton]]:
     buttons = []
     for v in route_vehicles:
-        plate    = str(v.get("u_statenum", "") or "").strip() or "б/н"
-        uid_v    = str(v.get("u_id", ""))
-        speed    = int(float(v.get("u_speed", 0) or 0))
-        terminal = str(v.get("rl_laststation_title", "") or "").strip()
-        label    = f"🚌 {plate}  {speed} км/ч"
-        if terminal:
-            label += f"  → {terminal}"
+        plate  = str(v.get("u_statenum", "") or "").strip() or "б/н"
+        uid_v  = str(v.get("u_id", ""))
+        speed  = int(float(v.get("u_speed", 0) or 0))
+        label  = f"🚌 {plate}  {speed} км/ч"
+        if stops is not None:
+            lat  = float(v.get("u_lat",  0) or 0)
+            lng  = float(v.get("u_long", 0) or 0)
+            stop = nearest_stop_name(lat, lng, stops) if lat and lng else None
+            if stop:
+                label += f"  📍 {stop}"
+        else:
+            terminal = str(v.get("rl_laststation_title", "") or "").strip()
+            if terminal:
+                label += f"  → {terminal}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"where:{uid_v}:{route}")])
     return buttons
 
@@ -1161,6 +1172,7 @@ async def on_filter_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if idx_str == "all":
         filtered   = route_vehicles
         dir_suffix = ""
+        stops      = None
     else:
         terminals     = context.user_data.get(f"filter_terms:{route}", [])
         idx           = int(idx_str)
@@ -1171,6 +1183,22 @@ async def on_filter_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         ] if terminal_name else route_vehicles
         dir_suffix = f"\n→ <b>{terminal_name}</b>" if terminal_name else ""
 
+        # Подгружаем остановки для отображения в кнопках
+        mr_id = mr_id_cache.get(route)
+        if not mr_id:
+            for v in vehicles:
+                if str(v.get("mr_num", "")).strip().upper() == route:
+                    mr_id = str(v.get("mr_id", "")).strip()
+                    if mr_id:
+                        mr_id_cache[route] = mr_id
+                        break
+        if mr_id:
+            if mr_id not in stops_cache:
+                stops_cache[mr_id] = fetch_route_stops(mr_id)
+            stops = stops_cache.get(mr_id) or None
+        else:
+            stops = None
+
     if not filtered:
         await query.edit_message_text(
             header + dir_suffix + "\n\nСейчас нет ТС в этом направлении.",
@@ -1179,7 +1207,7 @@ async def on_filter_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    buttons = _vehicle_buttons(route, filtered)
+    buttons = _vehicle_buttons(route, filtered, stops=stops)
     buttons.append([back_btn])
     await query.edit_message_text(
         header + dir_suffix + f"\n\nНа линии <b>{len(filtered)} ТС</b>. Выбери автобус:",
