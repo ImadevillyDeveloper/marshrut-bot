@@ -281,6 +281,26 @@ def _get_stop_id(stop_name: str) -> Optional[str]:
     return None
 
 
+def _canonical_stop_name(query: str) -> str:
+    """Возвращает каноническое название остановки из stops_cache (как на сайте).
+    Если не найдено — возвращает исходный запрос."""
+    q = query.lower()
+    best: Optional[str] = None
+    best_len = 0
+    for stops in stops_cache.values():
+        for s in stops:
+            n = s["name"]
+            nl = n.lower()
+            if q in nl or nl in q:
+                # Предпочитаем точное совпадение, потом самое короткое (конкретное)
+                if nl == q:
+                    return n
+                if len(n) > best_len:
+                    best = n
+                    best_len = len(n)
+    return best if best else query
+
+
 def db_add_card(uid: int, card_number: str, name: str, color: str) -> None:
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -1795,6 +1815,10 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
         )
         return
 
+    # Канонические названия остановок (как на сайте, не как ввёл пользователь)
+    from_display = _canonical_stop_name(from_stop)
+    to_display   = _canonical_stop_name(to_stop)
+
     # Прогноз прибытия на начальную остановку через API (то же что и окошко на сайте)
     st_id = _get_stop_id(from_stop)
     arrivals: list[dict] = fetch_stop_arrivals(st_id) if st_id else []
@@ -1880,7 +1904,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
 
     if not all_entries:
         await edit_fn(
-            f"Сейчас нет транспорта, следующего из «{from_stop}» до «{to_stop}».",
+            f"Сейчас нет транспорта, следующего из «{from_display}» до «{to_display}».",
             reply_markup=InlineKeyboardMarkup([[retry_btn], [new_dest_btn], [home_btn]]),
         )
         return
@@ -1900,7 +1924,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
     vehicle_btns.append([home_btn])
 
     await edit_fn(
-        f"🚏 <b>{from_stop}</b> → <b>{to_stop}</b>\n\nПрибытие на вашу остановку:",
+        f"🚏 <b>{from_display}</b> → <b>{to_display}</b>\n\nПрибытие на вашу остановку:",
         parse_mode=H,
         reply_markup=InlineKeyboardMarkup(vehicle_btns),
     )
