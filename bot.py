@@ -1487,6 +1487,69 @@ async def on_where_vehicle(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.edit_message_text(caption, parse_mode=H, reply_markup=back_markup)
 
 
+async def on_findbus_where_vehicle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Детали ТС, открытые из findbus-результатов. Кнопка назад ведёт к списку подходящих маршрутов."""
+    query = update.callback_query
+    await query.answer()
+
+    _, uid_v, route = query.data.split(":", 2)
+
+    vehicles = fetch_vehicles()
+    v = next((x for x in vehicles if str(x.get("u_id", "")) == uid_v), None)
+
+    back_btn = InlineKeyboardButton("◀️ Назад к маршрутам", callback_data="findbus:refresh")
+
+    if not v:
+        await query.edit_message_text(
+            "ТС уже не на линии.",
+            reply_markup=InlineKeyboardMarkup([[back_btn]]),
+        )
+        return
+
+    lat    = float(v.get("u_lat",  0) or 0)
+    lng    = float(v.get("u_long", 0) or 0)
+    plate  = str(v.get("u_statenum", "") or "").strip() or "б/н"
+    speed  = int(float(v.get("u_speed", 0) or 0))
+    course = v.get("u_course")
+    now    = datetime.now().strftime("%H:%M:%S")
+
+    stop_name = "нет данных"
+    mr_id = mr_id_cache.get(route)
+    if not mr_id:
+        for x in vehicles:
+            if str(x.get("mr_num", "")).strip().upper() == route:
+                mr_id = str(x.get("mr_id", "")).strip()
+                if mr_id:
+                    mr_id_cache[route] = mr_id
+                    break
+    if mr_id:
+        if mr_id not in stops_cache:
+            stops_cache[mr_id] = fetch_route_stops(mr_id)
+        stops = stops_cache.get(mr_id, [])
+        if stops:
+            stop_name = nearest_stop_name(lat, lng, stops) or "нет данных"
+
+    terminal    = str(v.get("rl_laststation_title", "") or "").strip()
+    terminal_ln = f"\n🏁 В сторону: <b>{terminal}</b>" if terminal else ""
+    description = OMSK_ROUTES.get(route, "")
+    desc_line   = f"\n<i>{description}</i>" if description else ""
+
+    caption = (
+        f"🚌 Маршрут <b>{route}</b>{desc_line}\n\n"
+        f"🚗 Госномер: <b>{plate}</b>\n"
+        f"🕐 Время: <b>{now}</b>\n"
+        f"⚡ Скорость: <b>{speed} км/ч</b>\n"
+        f"📍 Остановка: <b>{stop_name}</b>"
+        f"{terminal_ln}"
+    )
+
+    await query.edit_message_text(
+        caption,
+        parse_mode=H,
+        reply_markup=InlineKeyboardMarkup([[back_btn]]),
+    )
+
+
 # ── Фоновый опрос ──────────────────────────────────────────────────
 
 async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1997,7 +2060,7 @@ async def _show_findbus_results(edit_fn, context, from_stop: str, to_stop: str) 
             dist_str = f"{int(dist)} м" if dist < 1000 else f"{dist / 1000:.1f} км"
             loc_part = f"  📍 {near}" if near else ""
             label = f"🚌 {e['route_num']}{loc_part}  ({dist_str})"
-        cb = f"where:{e['uid_v']}:{e['route_num']}" if e["uid_v"] else "findbus:refresh"
+        cb = f"findbus_where:{e['uid_v']}:{e['route_num']}" if e["uid_v"] else "findbus:refresh"
         vehicle_btns.append([InlineKeyboardButton(label, callback_data=cb)])
 
     vehicle_btns.append([retry_btn, new_dest_btn])
@@ -2255,7 +2318,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_card_action,    pattern=r"^card:"))
     app.add_handler(CallbackQueryHandler(on_route_action,  pattern=r"^route:"))
     app.add_handler(CallbackQueryHandler(on_filter_action, pattern=r"^filter:"))
-    app.add_handler(CallbackQueryHandler(on_where_vehicle, pattern=r"^where:"))
+    app.add_handler(CallbackQueryHandler(on_where_vehicle,        pattern=r"^where:"))
+    app.add_handler(CallbackQueryHandler(on_findbus_where_vehicle, pattern=r"^findbus_where:"))
     app.add_handler(CallbackQueryHandler(on_findbus_action, pattern=r"^findbus:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
