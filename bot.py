@@ -2696,6 +2696,20 @@ async def _warmup_stops_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 ADMIN_ID = 684779015
 
 
+async def _backup_db_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Шлёт админу копию БД: на бесплатном хостинге диск не переживает передеплой/рестарт."""
+    try:
+        with open(DB_PATH, "rb") as f:
+            await context.bot.send_document(
+                chat_id=ADMIN_ID,
+                document=f,
+                filename="marshrut_backup.db",
+                caption=datetime.now().strftime("Бэкап БД: %Y-%m-%d %H:%M"),
+            )
+    except Exception:
+        log.exception("Не удалось отправить бэкап БД")
+
+
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ADMIN_ID:
         return
@@ -2796,6 +2810,7 @@ def main() -> None:
 
     app.job_queue.run_repeating(poll_job, interval=POLL_INTERVAL, first=15)
     app.job_queue.run_once(_warmup_stops_job, when=10)
+    app.job_queue.run_repeating(_backup_db_job, interval=6 * 3600, first=60)
 
     log.info("Бот запущен. Интервал опроса: %d сек.", POLL_INTERVAL)
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
