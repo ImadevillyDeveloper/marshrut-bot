@@ -134,16 +134,25 @@ def fetch_vehicles() -> list[dict]:
             if not sid:
                 return []
             rid = _next_id()
-            url, magic = _sign("getUnitsInRect", rid, sid)
-            r = http.post(url, headers=BUS55_HEADERS, json={
-                "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
-                "ts": _ts(), "id": rid,
-                "params": {
-                    "sid": sid, "magic": magic,
-                    "minlat": 54.80, "maxlat": 55.15,
-                    "minlong": 73.10, "maxlong": 73.70,
-                },
-            }, timeout=10)
+            params = {
+                "sid": sid,
+                "minlat": 54.80, "maxlat": 55.15,
+                "minlong": 73.10, "maxlong": 73.70,
+            }
+            try:
+                # Без подписи (?m=...) — с некоторых хостингов подписанный
+                # эндпоинт зависает по таймауту, базовый работает всегда.
+                r = http.post(BUS55_BASE, headers=BUS55_HEADERS, json={
+                    "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
+                    "ts": _ts(), "id": rid, "params": params,
+                }, timeout=6)
+            except http.exceptions.Timeout:
+                # Фоллбэк на подписанный URL — на некоторых хостингах верно обратное.
+                url, magic = _sign("getUnitsInRect", rid, sid)
+                r = http.post(url, headers=BUS55_HEADERS, json={
+                    "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
+                    "ts": _ts(), "id": rid, "params": {**params, "magic": magic},
+                }, timeout=10)
             data = r.json()
             if "error" in data:
                 code = data["error"].get("code", 0)
