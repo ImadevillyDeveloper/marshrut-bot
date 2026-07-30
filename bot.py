@@ -1582,19 +1582,35 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    await msg.edit_text("✅ Сессия OK. Запрашиваю ТС...", parse_mode=H)
+    await msg.edit_text("✅ Сессия OK. Тестирую оба варианта запроса...", parse_mode=H)
     sid2 = _get_sid()
-    rid2 = _next_id()
-    url2, magic2 = _sign("getUnitsInRect", rid2, sid2)
+
+    rid_u = _next_id()
+    t0 = time.monotonic()
     try:
-        r2 = http.post(url2, headers=BUS55_HEADERS, json={
+        r_u = http.post(BUS55_BASE, headers=BUS55_HEADERS, json={
             "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
-            "ts": _ts(), "id": rid2,
-            "params": {"sid": sid2, "magic": magic2, "minlat": 54.80, "maxlat": 55.15, "minlong": 73.10, "maxlong": 73.70},
-        }, timeout=12)
-        rect_line = f"HTTP {r2.status_code} — <code>{r2.text[:400]}</code>"
+            "ts": _ts(), "id": rid_u,
+            "params": {"sid": sid2, "minlat": 54.80, "maxlat": 55.15, "minlong": 73.10, "maxlong": 73.70},
+        }, timeout=20)
+        rect_unsigned = f"HTTP {r_u.status_code} за {time.monotonic()-t0:.1f}с — <code>{r_u.text[:300]}</code>"
     except Exception as e:
-        rect_line = f"Исключение: <code>{e}</code>"
+        rect_unsigned = f"Исключение за {time.monotonic()-t0:.1f}с: <code>{e}</code>"
+
+    rid_s = _next_id()
+    url_s, magic_s = _sign("getUnitsInRect", rid_s, sid2)
+    t1 = time.monotonic()
+    try:
+        r_s = http.post(url_s, headers=BUS55_HEADERS, json={
+            "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
+            "ts": _ts(), "id": rid_s,
+            "params": {"sid": sid2, "magic": magic_s, "minlat": 54.80, "maxlat": 55.15, "minlong": 73.10, "maxlong": 73.70},
+        }, timeout=20)
+        rect_signed = f"HTTP {r_s.status_code} за {time.monotonic()-t1:.1f}с — <code>{r_s.text[:300]}</code>"
+    except Exception as e:
+        rect_signed = f"Исключение за {time.monotonic()-t1:.1f}с: <code>{e}</code>"
+
+    rect_line = f"<b>без подписи:</b>\n{rect_unsigned}\n\n<b>с подписью (?m=...):</b>\n{rect_signed}"
 
     vehicles = fetch_vehicles()
     total = len(vehicles)
@@ -1603,7 +1619,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.edit_text(
             f"⚠️ Сессия открылась, но getUnitsInRect вернул 0 ТС.\n\n"
             f"<b>startSession:</b>\n{session_line}\n\n"
-            f"<b>getUnitsInRect:</b>\n{rect_line}",
+            f"{rect_line}",
             parse_mode=H,
         )
         return
