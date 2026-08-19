@@ -20,7 +20,8 @@ from collections import defaultdict
 from typing import Optional
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "marshrut.db")
+_DATA_DIR = "/data" if os.path.isdir("/data") else os.path.dirname(__file__)
+DB_PATH = os.path.join(_DATA_DIR, "marshrut.db")
 
 import requests as http
 from telegram import (
@@ -139,20 +140,13 @@ def fetch_vehicles() -> list[dict]:
                 "minlat": 54.80, "maxlat": 55.15,
                 "minlong": 73.10, "maxlong": 73.70,
             }
-            try:
-                # Без подписи (?m=...) — с некоторых хостингов подписанный
-                # эндпоинт зависает по таймауту, базовый работает всегда.
-                r = http.post(BUS55_BASE, headers=BUS55_HEADERS, json={
-                    "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
-                    "ts": _ts(), "id": rid, "params": params,
-                }, timeout=6)
-            except http.exceptions.Timeout:
-                # Фоллбэк на подписанный URL — на некоторых хостингах верно обратное.
-                url, magic = _sign("getUnitsInRect", rid, sid)
-                r = http.post(url, headers=BUS55_HEADERS, json={
-                    "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
-                    "ts": _ts(), "id": rid, "params": {**params, "magic": magic},
-                }, timeout=10)
+            # Подписанный URL (?m=...) — без подписи API всегда отвечает
+            # "Access denied", подпись обязательна для getUnitsInRect.
+            url, magic = _sign("getUnitsInRect", rid, sid)
+            r = http.post(url, headers=BUS55_HEADERS, json={
+                "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
+                "ts": _ts(), "id": rid, "params": {**params, "magic": magic},
+            }, timeout=10)
             data = r.json()
             if "error" in data:
                 code = data["error"].get("code", 0)
@@ -1582,35 +1576,19 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    await msg.edit_text("✅ Сессия OK. Тестирую оба варианта запроса...", parse_mode=H)
+    await msg.edit_text("✅ Сессия OK. Запрашиваю ТС...", parse_mode=H)
     sid2 = _get_sid()
-
-    rid_u = _next_id()
-    t0 = time.monotonic()
+    rid2 = _next_id()
+    url2, magic2 = _sign("getUnitsInRect", rid2, sid2)
     try:
-        r_u = http.post(BUS55_BASE, headers=BUS55_HEADERS, json={
+        r2 = http.post(url2, headers=BUS55_HEADERS, json={
             "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
-            "ts": _ts(), "id": rid_u,
-            "params": {"sid": sid2, "minlat": 54.80, "maxlat": 55.15, "minlong": 73.10, "maxlong": 73.70},
-        }, timeout=20)
-        rect_unsigned = f"HTTP {r_u.status_code} за {time.monotonic()-t0:.1f}с — <code>{r_u.text[:300]}</code>"
+            "ts": _ts(), "id": rid2,
+            "params": {"sid": sid2, "magic": magic2, "minlat": 54.80, "maxlat": 55.15, "minlong": 73.10, "maxlong": 73.70},
+        }, timeout=12)
+        rect_line = f"HTTP {r2.status_code} — <code>{r2.text[:400]}</code>"
     except Exception as e:
-        rect_unsigned = f"Исключение за {time.monotonic()-t0:.1f}с: <code>{e}</code>"
-
-    rid_s = _next_id()
-    url_s, magic_s = _sign("getUnitsInRect", rid_s, sid2)
-    t1 = time.monotonic()
-    try:
-        r_s = http.post(url_s, headers=BUS55_HEADERS, json={
-            "jsonrpc": BUS55_RPC, "method": "getUnitsInRect",
-            "ts": _ts(), "id": rid_s,
-            "params": {"sid": sid2, "magic": magic_s, "minlat": 54.80, "maxlat": 55.15, "minlong": 73.10, "maxlong": 73.70},
-        }, timeout=20)
-        rect_signed = f"HTTP {r_s.status_code} за {time.monotonic()-t1:.1f}с — <code>{r_s.text[:300]}</code>"
-    except Exception as e:
-        rect_signed = f"Исключение за {time.monotonic()-t1:.1f}с: <code>{e}</code>"
-
-    rect_line = f"<b>без подписи:</b>\n{rect_unsigned}\n\n<b>с подписью (?m=...):</b>\n{rect_signed}"
+        rect_line = f"Исключение: <code>{e}</code>"
 
     vehicles = fetch_vehicles()
     total = len(vehicles)
@@ -1619,7 +1597,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.edit_text(
             f"⚠️ Сессия открылась, но getUnitsInRect вернул 0 ТС.\n\n"
             f"<b>startSession:</b>\n{session_line}\n\n"
-            f"{rect_line}",
+            f"<b>getUnitsInRect:</b>\n{rect_line}",
             parse_mode=H,
         )
         return
