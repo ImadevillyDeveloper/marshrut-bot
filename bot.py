@@ -2699,18 +2699,20 @@ async def _warmup_stops_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 ADMIN_ID = 684779015
 
 
-async def _backup_db_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Шлёт админу копию БД: на бесплатном хостинге диск не переживает передеплой/рестарт."""
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Присылает админу копию БД по запросу."""
+    if update.effective_user.id != ADMIN_ID:
+        return
     try:
         with open(DB_PATH, "rb") as f:
-            await context.bot.send_document(
-                chat_id=ADMIN_ID,
+            await update.message.reply_document(
                 document=f,
                 filename="marshrut_backup.db",
                 caption=datetime.now().strftime("Бэкап БД: %Y-%m-%d %H:%M"),
             )
     except Exception:
         log.exception("Не удалось отправить бэкап БД")
+        await update.message.reply_text("Не удалось отправить бэкап БД")
 
 
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2781,6 +2783,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("backup",    cmd_backup))
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("track",  cmd_track))
     app.add_handler(CommandHandler("status", cmd_status))
@@ -2813,7 +2816,6 @@ def main() -> None:
 
     app.job_queue.run_repeating(poll_job, interval=POLL_INTERVAL, first=15)
     app.job_queue.run_once(_warmup_stops_job, when=10)
-    app.job_queue.run_repeating(_backup_db_job, interval=6 * 3600, first=60)
 
     log.info("Бот запущен. Интервал опроса: %d сек.", POLL_INTERVAL)
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
